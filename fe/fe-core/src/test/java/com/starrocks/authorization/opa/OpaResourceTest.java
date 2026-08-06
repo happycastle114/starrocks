@@ -16,8 +16,8 @@ package com.starrocks.authorization.opa;
 
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
+import com.starrocks.analysis.TableName;
 import com.starrocks.catalog.InternalCatalog;
-import com.starrocks.catalog.TableName;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 

@@ -15,12 +15,12 @@
 package com.starrocks.authorization.opa;
 
 import com.google.gson.annotations.SerializedName;
+import com.starrocks.analysis.TableName;
 import com.starrocks.authorization.ObjectType;
 import com.starrocks.authorization.PrivilegeType;
 import com.starrocks.catalog.InternalCatalog;
-import com.starrocks.catalog.TableName;
-import com.starrocks.catalog.UserIdentity;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.sql.ast.UserIdentity;
 
 import java.util.Comparator;
 import java.util.List;

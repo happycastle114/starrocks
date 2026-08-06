@@ -16,12 +16,12 @@ package com.starrocks.authorization.opa;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.starrocks.analysis.TableName;
 import com.starrocks.authorization.ObjectType;
 import com.starrocks.authorization.PrivilegeType;
-import com.starrocks.catalog.TableName;
-import com.starrocks.catalog.UserIdentity;
 import com.starrocks.common.util.UUIDUtil;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.utframe.UtFrameUtils;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
