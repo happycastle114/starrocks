@@ -16,6 +16,12 @@ package com.starrocks.authorization.opa;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.starrocks.analysis.ArithmeticExpr;
+import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.CompoundPredicate;
+import com.starrocks.analysis.Expr;
+import com.starrocks.analysis.NullLiteral;
+import com.starrocks.analysis.TableName;
 import com.starrocks.authorization.AccessControlProvider;
 import com.starrocks.authorization.AccessController;
 import com.starrocks.authorization.AccessDeniedException;
@@ -24,11 +30,8 @@ import com.starrocks.authorization.ObjectType;
 import com.starrocks.authorization.PEntryObject;
 import com.starrocks.authorization.PrivilegeType;
 import com.starrocks.catalog.Column;
-import com.starrocks.catalog.InternalCatalog;
-import com.starrocks.catalog.TableName;
-import com.starrocks.catalog.UserIdentity;
+import com.starrocks.catalog.Type;
 import com.starrocks.common.util.UUIDUtil;
-import com.starrocks.load.rejected.RejectedRecordsTable;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.ast.AstTraverser;
@@ -37,13 +40,8 @@ import com.starrocks.sql.ast.Relation;
 import com.starrocks.sql.ast.SelectRelation;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.SubqueryRelation;
-import com.starrocks.sql.ast.expression.ArithmeticExpr;
-import com.starrocks.sql.ast.expression.BinaryPredicate;
-import com.starrocks.sql.ast.expression.CompoundPredicate;
-import com.starrocks.sql.ast.expression.Expr;
-import com.starrocks.sql.ast.expression.NullLiteral;
+import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.sql.parser.SqlParser;
-import com.starrocks.type.IntegerType;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
 import org.junit.jupiter.api.Assertions;
@@ -58,6 +56,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
+@SuppressWarnings({"deprecation", "resource"})
 public class OpaAccessControllerTest {
     private static ConnectContext connectContext;
     private static StarRocksAssert starRocksAssert;
@@ -155,7 +154,7 @@ public class OpaAccessControllerTest {
         OpaAccessController controller = new OpaAccessController(client);
 
         Map<String, Expr> masks = Assertions.assertDoesNotThrow(() -> controller.getColumnMaskingPolicy(context(),
-                new TableName("db", "tbl"), Lists.newArrayList(new Column("v1", IntegerType.INT))));
+                new TableName("db", "tbl"), Lists.newArrayList(new Column("v1", Type.INT))));
 
         Assertions.assertTrue(masks.isEmpty());
     }
@@ -167,12 +166,12 @@ public class OpaAccessControllerTest {
         OpaAccessController controller = new OpaAccessController(client);
 
         Map<String, Expr> masks = controller.getColumnMaskingPolicy(context(), new TableName("db", "tbl"),
-                Lists.newArrayList(new Column("v1", IntegerType.INT)));
+                Lists.newArrayList(new Column("v1", Type.INT)));
         Assertions.assertTrue(masks.get("v1") instanceof NullLiteral);
 
         client.columnMasks.put("v1", "v1 + 1");
         masks = controller.getColumnMaskingPolicy(context(), new TableName("db", "tbl"),
-                Lists.newArrayList(new Column("v1", IntegerType.INT)));
+                Lists.newArrayList(new Column("v1", Type.INT)));
         Assertions.assertTrue(masks.get("v1") instanceof ArithmeticExpr);
     }
 
@@ -213,20 +212,6 @@ public class OpaAccessControllerTest {
     }
 
     @Test
-    public void testRejectedRecordsRowAccessPolicyPrecedesOpa() {
-        FakeOpaPolicyClient client = new FakeOpaPolicyClient();
-        OpaAccessController controller = new OpaAccessController(client);
-
-        Expr rowFilter = controller.getRowAccessPolicy(context(), new TableName(
-                InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME,
-                RejectedRecordsTable.DATABASE_NAME,
-                RejectedRecordsTable.TABLE_NAME));
-
-        Assertions.assertNotNull(rowFilter);
-        Assertions.assertTrue(client.rowFilterRequests.isEmpty());
-    }
-
-    @Test
     public void testBatchColumnMasksArePreferred() {
         FakeOpaPolicyClient client = new FakeOpaPolicyClient();
         client.supportBatch = true;
@@ -235,7 +220,7 @@ public class OpaAccessControllerTest {
 
         Map<String, Expr> masks = controller.getColumnMaskingPolicy(context(),
                 new TableName("default_catalog", "db1", "tbl1"),
-                Lists.newArrayList(new Column("v1", IntegerType.INT), new Column("v2", IntegerType.INT)));
+                Lists.newArrayList(new Column("v1", Type.INT), new Column("v2", Type.INT)));
 
         Assertions.assertEquals(1, client.batchMaskRequests.size());
         Assertions.assertTrue(client.columnMaskRequests.isEmpty());
@@ -250,7 +235,7 @@ public class OpaAccessControllerTest {
 
         Map<String, Expr> masks = controller.getColumnMaskingPolicy(context(),
                 new TableName("default_catalog", "db1", "tbl1"),
-                Lists.newArrayList(new Column("v1", IntegerType.INT), new Column("v2", IntegerType.INT)));
+                Lists.newArrayList(new Column("v1", Type.INT), new Column("v2", Type.INT)));
 
         Assertions.assertEquals(2, client.columnMaskRequests.size());
         Assertions.assertTrue(masks.get("v1") instanceof NullLiteral);

@@ -15,19 +15,18 @@
 package com.starrocks.authorization.opa;
 
 import com.google.gson.Gson;
+import com.starrocks.analysis.FunctionName;
+import com.starrocks.analysis.TableName;
 import com.starrocks.authorization.ObjectType;
 import com.starrocks.authorization.PrivilegeType;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.Function;
-import com.starrocks.catalog.FunctionName;
 import com.starrocks.catalog.InternalCatalog;
-import com.starrocks.catalog.TableName;
-import com.starrocks.catalog.UserIdentity;
+import com.starrocks.catalog.Type;
 import com.starrocks.common.util.UUIDUtil;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.sql.ast.pipe.PipeName;
-import com.starrocks.type.IntegerType;
-import com.starrocks.type.Type;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -143,8 +142,8 @@ public class OpaAccessControllerResourceCheckTest {
         RecordingOpaPolicyClient client = new RecordingOpaPolicyClient();
         OpaAccessController controller = new OpaAccessController(client);
         ConnectContext context = context();
-        Function function = new Function(new FunctionName("normalize"), new Type[] {IntegerType.INT},
-                IntegerType.INT, false);
+        Function function = new Function(new FunctionName("normalize"), new Type[] {Type.INT},
+                Type.INT, false);
 
         controller.checkFunctionAction(context, new Database(1, "sales"), function, PrivilegeType.USAGE);
         assertLastAction(client, new ExpectedAction(OpaRequest.OPERATION_CHECK, PrivilegeType.USAGE,

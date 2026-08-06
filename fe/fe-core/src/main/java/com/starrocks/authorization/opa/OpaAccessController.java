@@ -15,6 +15,8 @@
 package com.starrocks.authorization.opa;
 
 import com.google.common.collect.Maps;
+import com.starrocks.analysis.Expr;
+import com.starrocks.analysis.TableName;
 import com.starrocks.authorization.AccessController;
 import com.starrocks.authorization.AccessDeniedException;
 import com.starrocks.authorization.ExternalAccessController;
@@ -22,15 +24,12 @@ import com.starrocks.authorization.NativeAccessController;
 import com.starrocks.authorization.ObjectType;
 import com.starrocks.authorization.PEntryObject;
 import com.starrocks.authorization.PrivilegeType;
-import com.starrocks.authorization.RejectedRecordsRowAccessPolicy;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.Function;
 import com.starrocks.catalog.InternalCatalog;
-import com.starrocks.catalog.TableName;
-import com.starrocks.catalog.UserIdentity;
 import com.starrocks.qe.ConnectContext;
-import com.starrocks.sql.ast.expression.Expr;
+import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.sql.ast.pipe.PipeName;
 import com.starrocks.sql.parser.SqlParser;
 import org.apache.commons.lang3.StringUtils;
@@ -261,10 +260,6 @@ public class OpaAccessController extends ExternalAccessController implements Aut
 
     @Override
     public Expr getRowAccessPolicy(ConnectContext context, TableName tableName) {
-        if (RejectedRecordsRowAccessPolicy.matches(tableName)) {
-            return RejectedRecordsRowAccessPolicy.buildPolicy(context, tableName);
-        }
-
         List<String> filters = opaClient.getRowFilters(
                 OpaRequest.create(context, OpaRequest.OPERATION_GET_ROW_FILTERS, PrivilegeType.SELECT,
                         ObjectType.TABLE, OpaResource.table(tableName))).stream()
