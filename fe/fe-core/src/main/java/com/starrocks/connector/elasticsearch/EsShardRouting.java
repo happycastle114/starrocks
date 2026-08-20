@@ -42,12 +42,14 @@ public class EsShardRouting {
     public static EsShardRouting newSearchShard(String indexName, int shardId, boolean isPrimary,
                                                 String nodeId, JSONObject nodesMap) {
         JSONObject nodeInfo = nodesMap.getJSONObject(nodeId);
-        String[] transportAddr = nodeInfo.getString("transport_address").split(":");
+        String transportAddress = nodeInfo.optString("transport_address", null);
         // get thrift port from node info
-        String thriftPort = nodeInfo.getJSONObject("attributes").optString("thrift_port");
+        JSONObject attributes = nodeInfo.optJSONObject("attributes");
+        String thriftPort = attributes != null ? attributes.optString("thrift_port") : null;
         // In http transport mode, should ignore thrift_port, set address to null
         TNetworkAddress addr = null;
-        if (!StringUtils.isEmpty(thriftPort)) {
+        if (!StringUtils.isEmpty(thriftPort) && transportAddress != null) {
+            String[] transportAddr = transportAddress.split(":");
             addr = new TNetworkAddress(transportAddr[0], Integer.parseInt(thriftPort));
         }
         return new EsShardRouting(indexName, shardId, isPrimary, addr, nodeId);

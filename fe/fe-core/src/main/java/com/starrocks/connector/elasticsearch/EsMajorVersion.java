@@ -107,6 +107,13 @@ public class EsMajorVersion {
         if (version.startsWith("8.")) {
             return new EsMajorVersion((byte) 8, version);
         }
+        try {
+            int major = Integer.parseInt(version.substring(0, version.indexOf('.')));
+            if (major >= 3) {
+                return new EsMajorVersion((byte) 7, version);
+            }
+        } catch (Exception ignored) {
+        }
         throw new StarRocksConnectorException("Unsupported/Unknown ES Cluster version [" + version + "]." +
                 "Highest supported version is [" + LATEST.version + "].");
     }
