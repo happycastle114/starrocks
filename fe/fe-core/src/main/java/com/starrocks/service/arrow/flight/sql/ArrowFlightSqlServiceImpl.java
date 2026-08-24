@@ -26,12 +26,14 @@ import com.starrocks.analysis.Expr;
 import com.starrocks.authorization.SecurityPolicyRewriteRule;
 import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
+import com.starrocks.common.ErrorCode;
 import com.starrocks.common.InvalidConfException;
 import com.starrocks.common.Pair;
 import com.starrocks.common.ThreadPoolManager;
 import com.starrocks.common.util.DebugUtil;
 import com.starrocks.qe.GlobalVariable;
 import com.starrocks.qe.OriginStatement;
+import com.starrocks.qe.QueryState;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.service.arrow.flight.sql.session.ArrowFlightSqlSessionManager;
 import com.starrocks.sql.analyzer.Analyzer;
@@ -51,6 +53,7 @@ import org.apache.arrow.flight.FlightConstants;
 import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
+import org.apache.arrow.flight.FlightRuntimeException;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.Location;
 import org.apache.arrow.flight.NoOpSessionOptionValueVisitor;
@@ -878,8 +881,17 @@ public class ArrowFlightSqlServiceImpl implements FlightSqlProducer, AutoCloseab
             return buildFlightInfo(ticketStatement, descriptor, schema, endpoint);
         } catch (Exception e) {
             LOG.warn("[ARROW] failed to getFlightInfoFromQuery [queryID={}]", DebugUtil.printId(ctx.getExecutionId()), e);
-            throw CallStatus.INTERNAL.withDescription(e.getMessage()).toRuntimeException();
+            throw queryFailure(ctx.getState(), e);
         }
+    }
+
+    static FlightRuntimeException queryFailure(QueryState queryState, Exception cause) {
+        ErrorCode errorCode = queryState.getErrorCode();
+        CallStatus status = errorCode == ErrorCode.ERR_ACCESS_DENIED
+                || errorCode == ErrorCode.ERR_ACCESS_DENIED_FOR_EXTERNAL_ACCESS_CONTROLLER
+                ? CallStatus.UNAUTHORIZED
+                : CallStatus.INTERNAL;
+        return status.withDescription(cause.getMessage()).withCause(cause).toRuntimeException();
     }
 
     protected Pair<Location, ByteString> getFEEndpoint(ArrowFlightSqlConnectContext ctx) throws InvalidConfException {

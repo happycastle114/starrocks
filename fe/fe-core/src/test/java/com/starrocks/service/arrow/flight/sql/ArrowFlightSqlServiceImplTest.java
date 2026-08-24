@@ -20,6 +20,7 @@ import com.google.protobuf.ByteString;
 import com.starrocks.analysis.ParseNode;
 import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
+import com.starrocks.common.ErrorCode;
 import com.starrocks.metric.LongCounterMetric;
 import com.starrocks.metric.MetricRepo;
 import com.starrocks.plugin.AuditEvent;
@@ -44,6 +45,7 @@ import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.flight.FlightProducer;
 import org.apache.arrow.flight.FlightRuntimeException;
+import org.apache.arrow.flight.FlightStatusCode;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.Location;
 import org.apache.arrow.flight.NoOpSessionOptionValueVisitor;
@@ -204,6 +206,34 @@ public class ArrowFlightSqlServiceImplTest {
 
         service = new ArrowFlightSqlServiceImpl(sessionManager,
                 Location.forGrpcInsecure("localhost", 1234));
+    }
+
+    @Test
+    public void testQueryFailurePreservesAuthorizationStatus() {
+        QueryState queryState = new QueryState();
+        queryState.setErrorCode(ErrorCode.ERR_ACCESS_DENIED);
+
+        FlightRuntimeException internalAuthorizationException = ArrowFlightSqlServiceImpl.queryFailure(
+                queryState,
+                new DdlException("authorization failed"));
+
+        assertEquals(FlightStatusCode.UNAUTHORIZED, internalAuthorizationException.status().code());
+
+        queryState.setErrorCode(ErrorCode.ERR_ACCESS_DENIED_FOR_EXTERNAL_ACCESS_CONTROLLER);
+
+        FlightRuntimeException externalAuthorizationException = ArrowFlightSqlServiceImpl.queryFailure(
+                queryState,
+                new DdlException("authorization failed"));
+
+        assertEquals(FlightStatusCode.UNAUTHORIZED, externalAuthorizationException.status().code());
+
+        queryState.setErrorCode(null);
+
+        FlightRuntimeException internalException = ArrowFlightSqlServiceImpl.queryFailure(
+                queryState,
+                new DdlException("query failed"));
+
+        assertEquals(FlightStatusCode.INTERNAL, internalException.status().code());
     }
 
     @Test
