@@ -15,6 +15,7 @@
 package com.starrocks.sql.ast;
 
 import com.starrocks.analysis.Expr;
+import com.starrocks.analysis.GroupByClause;
 import com.starrocks.analysis.OrderByElement;
 import com.starrocks.analysis.Subquery;
 import com.starrocks.sql.ast.pipe.CreatePipeStmt;
@@ -127,6 +128,12 @@ public class AstTraverser<R, C> implements AstVisitor<R, C> {
 
         if (node.getOutputExpression() != null) {
             node.getOutputExpression().forEach(x -> visit(x, context));
+        } else if (node.getSelectList() != null) {
+            // outputExpression is populated by the analyzer. Before analysis, expressions (including
+            // scalar subqueries) only live in the parser-owned select list.
+            node.getSelectList().getItems().stream()
+                    .filter(x -> !x.isStar())
+                    .forEach(x -> visit(x.getExpr(), context));
         }
 
         if (node.getPredicate() != null) {
@@ -135,6 +142,18 @@ public class AstTraverser<R, C> implements AstVisitor<R, C> {
 
         if (node.getGroupBy() != null) {
             node.getGroupBy().forEach(x -> visit(x, context));
+        } else if (node.getGroupByClause() != null) {
+            // groupBy is analyzer-owned. Traverse the non-generating parser representation before
+            // analysis so scalar subqueries are not skipped or the AST mutated by the visitor.
+            GroupByClause groupByClause = node.getGroupByClause();
+            if (groupByClause.getGroupingType() == GroupByClause.GroupingType.GROUPING_SETS) {
+                if (groupByClause.getGroupingSetList() != null) {
+                    groupByClause.getGroupingSetList().forEach(
+                            groupingSet -> groupingSet.forEach(x -> visit(x, context)));
+                }
+            } else if (groupByClause.getOriGroupingExprs() != null) {
+                groupByClause.getOriGroupingExprs().forEach(x -> visit(x, context));
+            }
         }
 
         if (node.getAggregate() != null) {
@@ -162,6 +181,47 @@ public class AstTraverser<R, C> implements AstVisitor<R, C> {
     @Override
     public R visitSubqueryRelation(SubqueryRelation node, C context) {
         return visit(node.getQueryStatement(), context);
+    }
+
+    @Override
+    public R visitPivotRelation(PivotRelation node, C context) {
+        visitRelation(node, context);
+        if (node.getAggregateFunctions() != null) {
+            node.getAggregateFunctions().forEach(x -> visit(x.getFunctionCallExpr(), context));
+        }
+
+        if (node.getPivotColumns() != null) {
+            node.getPivotColumns().forEach(x -> visit(x, context));
+        }
+
+        if (node.getQuery() != null) {
+            return visit(node.getQuery(), context);
+        }
+        return null;
+    }
+
+    @Override
+    public R visitValues(ValuesRelation node, C context) {
+        node.getRows().forEach(row -> row.forEach(x -> visit(x, context)));
+        return visitRelation(node, context);
+    }
+
+    @Override
+    public R visitTableFunction(TableFunctionRelation node, C context) {
+        // childExpressions is analyzer-owned. Use the original function parameters before analysis,
+        // and avoid visiting both representations after analysis.
+        if (node.getChildExpressions() != null) {
+            node.getChildExpressions().forEach(x -> visit(x, context));
+        } else if (node.getFunctionParams() != null && node.getFunctionParams().exprs() != null) {
+            node.getFunctionParams().exprs().forEach(x -> visit(x, context));
+        }
+        return visitRelation(node, context);
+    }
+
+    @Override
+    public R visitNormalizedTableFunction(NormalizedTableFunctionRelation node, C context) {
+        visitRelation(node, context);
+        return visitJoin(node, context);
     }
 
     @Override

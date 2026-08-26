@@ -21,22 +21,40 @@ import org.junit.jupiter.api.Test;
 
 import java.util.Map;
 
-import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ArrowFlightSqlConnectProcessorTest {
-    @Test
-    public void testParseMarksRelationsForPolicyRewrite() throws Exception {
+    private static void assertParseMarksRelationsForPolicyRewrite(String sql, int expected) throws Exception {
         ArrowFlightSqlConnectContext context = new ArrowFlightSqlConnectContext("token");
-        ArrowFlightSqlConnectProcessor processor = new ArrowFlightSqlConnectProcessor(
-                context,
-                "SELECT * FROM db1.tbl1 JOIN db1.tbl2 ON tbl1.id = tbl2.id");
-        StatementBase parsedStatement = processor.parse(
-                "SELECT * FROM db1.tbl1 JOIN db1.tbl2 ON tbl1.id = tbl2.id",
-                context.getSessionVariable());
+        ArrowFlightSqlConnectProcessor processor = new ArrowFlightSqlConnectProcessor(context, sql);
+        StatementBase parsedStatement = processor.parse(sql, context.getSessionVariable());
 
         Map<?, Relation> relations = AnalyzerUtils.collectAllTableAndViewRelations(parsedStatement);
-        assertFalse(relations.isEmpty());
-        assertTrue(relations.values().stream().allMatch(Relation::isNeedRewrittenByPolicy));
+        assertEquals(expected, relations.size(), "Unexpected relation count for: " + sql);
+        assertTrue(relations.values().stream().allMatch(Relation::isNeedRewrittenByPolicy),
+                "Flight parser left a relation unmarked for policy rewrite in: " + sql);
+    }
+
+    @Test
+    public void testParseMarksRelationsForPolicyRewriteInPlainJoin() throws Exception {
+        assertParseMarksRelationsForPolicyRewrite(
+                "SELECT * FROM db1.tbl1 JOIN db1.tbl2 ON tbl1.id = tbl2.id", 2);
+    }
+
+    @Test
+    public void testParseMarksRelationsForPolicyRewriteInParserOwnedQueryExpressions() throws Exception {
+        assertParseMarksRelationsForPolicyRewrite(
+                "SELECT (SELECT k1 FROM db1.tbl1) FROM db1.tbl2", 2);
+        assertParseMarksRelationsForPolicyRewrite(
+                "SELECT COUNT(*) FROM db1.tbl1 GROUP BY (SELECT MAX(k1) FROM db1.tbl2)", 2);
+        assertParseMarksRelationsForPolicyRewrite(
+                "SELECT * FROM db1.tbl1 PIVOT (MAX(k1) FOR k2 IN ('a'))", 1);
+        assertParseMarksRelationsForPolicyRewrite(
+                "SELECT * FROM UNNEST((SELECT ARRAY_AGG(k1) FROM db1.tbl1))", 1);
+        assertParseMarksRelationsForPolicyRewrite(
+                "SELECT * FROM TABLE(UNNEST((SELECT ARRAY_AGG(k1) FROM db1.tbl1)))", 1);
+        assertParseMarksRelationsForPolicyRewrite(
+                "SELECT * FROM (VALUES ((SELECT MAX(k1) FROM db1.tbl1))) v", 1);
     }
 }
