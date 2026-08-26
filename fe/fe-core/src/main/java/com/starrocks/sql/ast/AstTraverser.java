@@ -229,6 +229,9 @@ public class AstTraverser<R, C> implements AstVisitor<R, C> {
         if (node.hasWithClause()) {
             node.getCteRelations().forEach(x -> visit(x, context));
         }
+        if (node.getOrderBy() != null) {
+            node.getOrderBy().forEach(x -> visit(x.getExpr(), context));
+        }
         node.getRelations().forEach(x -> visit(x, context));
         return null;
     }

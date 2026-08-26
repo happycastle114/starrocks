@@ -14,9 +14,15 @@
 package com.starrocks.http;
 
 import com.starrocks.metric.MetricRepo;
+import com.starrocks.proto.PQueryStatistics;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.qe.OriginStatement;
+import com.starrocks.qe.StmtExecutor;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.service.ExecuteEnv;
+import com.starrocks.sql.analyzer.AnalyzerUtils;
+import com.starrocks.sql.ast.StatementBase;
+import com.starrocks.sql.parser.SqlParser;
 import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
@@ -27,10 +33,13 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.MethodOrderer.MethodName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
+import org.mockito.MockedConstruction;
+import org.mockito.Mockito;
 
 import java.io.IOException;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @TestMethodOrder(MethodName.class)
 public class ExecuteSqlActionTest extends StarRocksHttpTestCase {
@@ -206,5 +215,44 @@ public class ExecuteSqlActionTest extends StarRocksHttpTestCase {
         jsonObject = new JSONObject(respStr);
         Assertions.assertEquals("FAILED", jsonObject.get("status").toString());
         Assertions.assertTrue(jsonObject.get("msg").toString().contains("Unknown system variable"));
+    }
+
+    @Test
+    public void test3HttpQueryMarksRelationsForPolicyRewrite() throws Exception {
+        String sql = "select * from " + DB_NAME + "." + TABLE_NAME;
+        HttpConnectContext context = new HttpConnectContext();
+        context.setQualifiedUser("root");
+        context.setRemoteIP("127.0.0.1");
+        context.setCurrentCatalog("default_catalog");
+        context.setDatabase(DB_NAME);
+        StatementBase statement = SqlParser.parse(sql, context.getSessionVariable()).get(0);
+        statement.setOrigStmt(new OriginStatement(sql));
+        context.setStatement(statement);
+        HttpConnectProcessor processor = new HttpConnectProcessor(context) {
+            @Override
+            public void auditAfterExec(
+                    String originalStatement,
+                    StatementBase parsedStatement,
+                    PQueryStatistics statistics) {
+                // Audit behavior is outside this entry-point marking contract.
+            }
+        };
+
+        AtomicBoolean sawMarkedRelation = new AtomicBoolean();
+        try (MockedConstruction<StmtExecutor> ignored = Mockito.mockConstruction(
+                StmtExecutor.class,
+                (mock, construction) -> {
+                    StatementBase constructedStatement = (StatementBase) construction.arguments().get(1);
+                    var relations = AnalyzerUtils.collectAllTableAndViewRelations(constructedStatement);
+                    sawMarkedRelation.set(
+                            !relations.isEmpty() && relations.values().stream()
+                                            .allMatch(relation -> relation.isNeedRewrittenByPolicy()));
+                    Mockito.when(mock.isForwardToLeader()).thenReturn(false);
+                    Mockito.when(mock.getParsedStmt()).thenReturn(constructedStatement);
+                })) {
+            processor.processOnce();
+        }
+        Assertions.assertTrue(sawMarkedRelation.get(),
+                "HTTP SQL must mark table relations before constructing StmtExecutor");
     }
 }

@@ -62,6 +62,13 @@ public class AstTraverserTest {
     public void testReachesRelationsInPlainJoin() {
         assertTablesReachedAndMarked(
                 "select * from db1.tbl1 a join db1.tbl2 b on a.k1 = b.k1", 2);
+
+        StatementBase selfJoin = parse(
+                "select * from db1.tbl1 a join db1.tbl1 b on a.k1 = b.k1");
+        List<TableRelation> aliases = collectTableRelations(selfJoin);
+        Assertions.assertEquals(2, aliases.size(), "same-table aliases must not collapse in traversal");
+        SecurityPolicyRewriteRule.markRelationsForRewrite(selfJoin);
+        Assertions.assertTrue(aliases.stream().allMatch(Relation::isNeedRewrittenByPolicy));
     }
 
     @Test
@@ -77,5 +84,7 @@ public class AstTraverserTest {
                 "select * from table(unnest((select array_agg(k1) from db1.tbl1)))", 1);
         assertTablesReachedAndMarked(
                 "select * from (values ((select max(k1) from db1.tbl1))) v", 1);
+        assertTablesReachedAndMarked(
+                "select 1 union all select 2 order by (select max(k1) from db1.tbl1)", 1);
     }
 }

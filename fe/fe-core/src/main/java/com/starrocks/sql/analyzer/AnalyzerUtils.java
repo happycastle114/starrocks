@@ -611,7 +611,6 @@ public class AnalyzerUtils {
         public Void visitTableFunction(TableFunctionRelation node, Void context) {
             // TableFunctionRelation is also a subquery
             ctes.add(node.getAlias());
-            node.getChildExpressions().forEach(this::visit);
             return super.visitTableFunction(node, context);
         }
 

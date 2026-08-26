@@ -18,6 +18,7 @@ package com.starrocks.sql.analyzer;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.TableName;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.OlapTable;
@@ -26,10 +27,13 @@ import com.starrocks.common.Pair;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.ast.AddPartitionClause;
+import com.starrocks.sql.ast.AstTraverser;
+import com.starrocks.sql.ast.AstVisitor;
 import com.starrocks.sql.ast.CreateViewStmt;
 import com.starrocks.sql.ast.ListPartitionDesc;
 import com.starrocks.sql.ast.PartitionDesc;
 import com.starrocks.sql.ast.StatementBase;
+import com.starrocks.sql.ast.TableFunctionRelation;
 import com.starrocks.sql.parser.SqlParser;
 import com.starrocks.utframe.UtFrameUtils;
 import org.apache.hadoop.util.Sets;
@@ -37,6 +41,7 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -101,6 +106,30 @@ public class AnalyzeUtilTest {
         stringDatabaseMap = AnalyzerUtils.collectAllDatabase(AnalyzeTestUtil.getConnectContext(), statementBase.get(0));
         Assertions.assertEquals(stringDatabaseMap.size(), 1);
         Assertions.assertEquals("[test]", stringDatabaseMap.keySet().toString());
+    }
+
+    @Test
+    public void testCollectTableFunctionArgumentsOnceAfterAnalysis() {
+        StatementBase statement = analyzeSuccess("select * from test.tarray, unnest(v3)");
+        TableFunctionRelation[] tableFunction = new TableFunctionRelation[1];
+        new AstTraverser<Void, Void>() {
+            @Override
+            public Void visitTableFunction(TableFunctionRelation node, Void context) {
+                tableFunction[0] = node;
+                return super.visitTableFunction(node, context);
+            }
+        }.visit(statement);
+
+        Assertions.assertNotNull(tableFunction[0]);
+        Assertions.assertEquals(1, tableFunction[0].getChildExpressions().size());
+        CountingSlotRef argument = new CountingSlotRef(
+                (SlotRef) tableFunction[0].getChildExpressions().get(0));
+        tableFunction[0].setChildExpressions(Collections.singletonList(argument));
+
+        AnalyzerUtils.collectAllSelectTableColumns(statement);
+
+        Assertions.assertEquals(1, argument.acceptCount,
+                "analyzed table-function arguments must be traversed exactly once");
     }
 
     @Test
@@ -538,6 +567,20 @@ public class AnalyzeUtilTest {
         } else {
             // If not alphabetic, just continue to the next character
             generateHelper(chars, index + 1, results);
+        }
+    }
+
+    private static final class CountingSlotRef extends SlotRef {
+        private int acceptCount;
+
+        private CountingSlotRef(SlotRef other) {
+            super(other);
+        }
+
+        @Override
+        public <R, C> R accept(AstVisitor<R, C> visitor, C context) throws SemanticException {
+            acceptCount++;
+            return super.accept(visitor, context);
         }
     }
 }
