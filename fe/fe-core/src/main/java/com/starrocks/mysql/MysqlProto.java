@@ -50,8 +50,10 @@ import com.starrocks.mysql.privilege.AuthPlugin;
 import com.starrocks.mysql.ssl.SSLContextLoader;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.ConnectScheduler;
+import com.starrocks.qe.SessionVariable;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.service.ExecuteEnv;
+import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.ast.UserIdentity;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -59,6 +61,7 @@ import org.apache.logging.log4j.Logger;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 
@@ -233,12 +236,19 @@ public class MysqlProto {
             return false;
         }
         // save previous user login info
-        UserIdentity previousUserIdentity = context.getCurrentUserIdentity();
-        Set<Long> previousRoleIds = context.getCurrentRoleIds();
-        String previousQualifiedUser = context.getQualifiedUser();
-        String previousResourceGroup = context.getSessionVariable().getResourceGroup();
+        AuthenticationState previousAuthenticationState = AuthenticationState.capture(context);
+        String previousQualifiedUser = previousAuthenticationState.qualifiedUser();
+        SessionVariable previousSessionVariable = (SessionVariable) context.getSessionVariable().clone();
         String previousCatalog = context.getCurrentCatalog();
         String previousDb = context.getDatabase();
+        boolean previousWasRangerManaged;
+        try {
+            previousWasRangerManaged = Authorizer.isRangerManagedContext(context);
+        } catch (RuntimeException e) {
+            return rejectRangerManagedChangeUser(context, previousAuthenticationState,
+                    previousSessionVariable, previousCatalog, previousDb,
+                    previousQualifiedUser, changeUserPacket.getUser(), e);
+        }
         // do authenticate again
 
         try {
@@ -247,12 +257,23 @@ public class MysqlProto {
         } catch (AuthenticationException e) {
             LOG.warn("Command `Change user` failed, from [{}] to [{}]. ", previousQualifiedUser,
                     changeUserPacket.getUser());
+            previousAuthenticationState.restore(context);
+            context.setSessionVariable(previousSessionVariable);
             sendResponsePacket(context);
             // reconstruct serializer with context capability
             context.getSerializer().setCapability(context.getCapability());
-            // recover from previous user login info
-            context.getSessionVariable().setResourceGroup(previousResourceGroup);
             return false;
+        }
+        try {
+            if (previousWasRangerManaged || Authorizer.isRangerManagedContext(context)) {
+                return rejectRangerManagedChangeUser(context, previousAuthenticationState,
+                        previousSessionVariable, previousCatalog, previousDb,
+                        previousQualifiedUser, changeUserPacket.getUser(), null);
+            }
+        } catch (RuntimeException e) {
+            return rejectRangerManagedChangeUser(context, previousAuthenticationState,
+                    previousSessionVariable, previousCatalog, previousDb,
+                    previousQualifiedUser, changeUserPacket.getUser(), e);
         }
         // set database
         String db = changeUserPacket.getDb();
@@ -265,16 +286,14 @@ public class MysqlProto {
                 if (!context.getState().isError()) {
                     context.getState().setError(e.getMessage());
                 }
-                sendResponsePacket(context);
-                // reconstruct serializer with context capability
-                context.getSerializer().setCapability(context.getCapability());
                 context.setCurrentCatalog(previousCatalog);
                 context.setDatabase(previousDb);
                 // recover from previous user login info
-                context.getSessionVariable().setResourceGroup(previousResourceGroup);
-                context.setCurrentUserIdentity(previousUserIdentity);
-                context.setCurrentRoleIds(previousRoleIds);
-                context.setQualifiedUser(previousQualifiedUser);
+                context.setSessionVariable(previousSessionVariable);
+                previousAuthenticationState.restore(context);
+                sendResponsePacket(context);
+                // reconstruct serializer with context capability
+                context.getSerializer().setCapability(context.getCapability());
                 return false;
             }
         }
@@ -284,20 +303,58 @@ public class MysqlProto {
         if (!userChangeResult.first) {
             context.getState().setErrorCode(ErrorCode.ERR_TOO_MANY_USER_CONNECTIONS);
             context.getState().setError(userChangeResult.second);
-            sendResponsePacket(context);
-            context.getSerializer().setCapability(context.getCapability());
-            context.getSessionVariable().setResourceGroup(previousResourceGroup);
-            context.setCurrentUserIdentity(previousUserIdentity);
-            context.setCurrentRoleIds(previousRoleIds);
-            context.setQualifiedUser(previousQualifiedUser);
+            context.setSessionVariable(previousSessionVariable);
+            previousAuthenticationState.restore(context);
             context.setCurrentCatalog(previousCatalog);
             context.setDatabase(previousDb);
+            sendResponsePacket(context);
+            context.getSerializer().setCapability(context.getCapability());
             return false;
         }
 
         LOG.info("Command `Change user` succeeded, from [{}] to [{}]. ", previousQualifiedUser,
                 context.getQualifiedUser());
         return true;
+    }
+
+    private static boolean rejectRangerManagedChangeUser(
+            ConnectContext context, AuthenticationState previousAuthenticationState,
+            SessionVariable previousSessionVariable, String previousCatalog, String previousDb,
+            String previousUser, String targetUser, RuntimeException cause) throws IOException {
+        LOG.warn("Command `Change user` denied at Ranger-managed identity boundary, from [{}] to [{}].",
+                previousUser, targetUser, cause);
+        previousAuthenticationState.restore(context);
+        context.setSessionVariable(previousSessionVariable);
+        context.setCurrentCatalog(previousCatalog);
+        context.setDatabase(previousDb);
+        context.getState().setErrorCode(ErrorCode.ERR_ACCESS_DENIED_FOR_EXTERNAL_ACCESS_CONTROLLER);
+        context.getState().setError("COM_CHANGE_USER is not allowed for Ranger-managed users");
+        sendResponsePacket(context);
+        context.getSerializer().setCapability(context.getCapability());
+        return false;
+    }
+
+    private record AuthenticationState(UserIdentity currentUserIdentity, String qualifiedUser, Set<Long> currentRoleIds,
+                                       Set<String> groups, String securityIntegration, String distinguishedName) {
+        private static AuthenticationState capture(ConnectContext context) {
+            return new AuthenticationState(
+                    context.getCurrentUserIdentity(), context.getQualifiedUser(),
+                    copySet(context.getCurrentRoleIds()), copySet(context.getGroups()),
+                    context.getSecurityIntegration(), context.getDistinguishedName());
+        }
+
+        private void restore(ConnectContext context) {
+            context.setCurrentUserIdentity(currentUserIdentity);
+            context.setQualifiedUser(qualifiedUser);
+            context.setCurrentRoleIds(copySet(currentRoleIds));
+            context.setGroups(copySet(groups));
+            context.setSecurityIntegration(securityIntegration);
+            context.setDistinguishedName(distinguishedName);
+        }
+
+        private static <T> Set<T> copySet(Set<T> values) {
+            return values == null ? null : new HashSet<>(values);
+        }
     }
 
     public static boolean isRemoteIPLocalhost(String remoteIP) {

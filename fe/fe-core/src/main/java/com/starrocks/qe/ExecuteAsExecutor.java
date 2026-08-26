@@ -19,6 +19,7 @@ import com.starrocks.authentication.AuthenticationHandler;
 import com.starrocks.authentication.UserProperty;
 import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
+import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.ast.ExecuteAsStmt;
 import com.starrocks.sql.ast.SetStmt;
 import com.starrocks.sql.ast.UserIdentity;
@@ -44,6 +45,9 @@ public class ExecuteAsExecutor {
     public static void execute(ExecuteAsStmt stmt, ConnectContext ctx) throws DdlException {
         // only support WITH NO REVERT for now
         Preconditions.checkArgument(!stmt.isAllowRevert());
+        if ("hybrid_ranger_users".equals(Config.access_control) && Authorizer.isRangerManagedContext(ctx)) {
+            throw new DdlException("EXECUTE AS is not allowed for Ranger-managed users");
+        }
         LOG.info("{} EXEC AS {} from now on", ctx.getCurrentUserIdentity(), stmt.getToUser());
 
         UserIdentity userIdentity = stmt.getToUser();

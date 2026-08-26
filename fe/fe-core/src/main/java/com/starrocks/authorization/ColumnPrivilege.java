@@ -62,6 +62,8 @@ public class ColumnPrivilege {
             return;
         }
 
+        RangerManagedViewSecurity.check(context, stmt);
+
         Map<TableName, Table> tableNameTableObj = Maps.newHashMap();
         Map<Table, TableName> tableObjectToTableName = Maps.newHashMap();
         new TableNameCollector(tableNameTableObj, tableObjectToTableName).visit(stmt);
@@ -90,7 +92,8 @@ public class ColumnPrivilege {
         for (TableName tableName : tableNameTableObj.keySet()) {
             String catalog = tableName.getCatalog() == null ?
                     InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME : tableName.getCatalog();
-            if (Authorizer.getInstance().getAccessControlOrDefault(catalog) instanceof ExternalAccessController) {
+            if (Authorizer.getInstance().getAccessControlOrDefault(catalog, context) instanceof
+                    ExternalAccessController) {
                 tableUsedExternalAccessController.add(tableName);
             }
         }

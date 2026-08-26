@@ -14,11 +14,14 @@
 
 package com.starrocks.mysql;
 
+import com.starrocks.authentication.AuthenticationException;
+import com.starrocks.authentication.AuthenticationHandler;
 import com.starrocks.authentication.AuthenticationMgr;
 import com.starrocks.authorization.AccessDeniedException;
 import com.starrocks.authorization.MockedLocalMetaStore;
 import com.starrocks.authorization.RBACMockedMetadataMgr;
 import com.starrocks.common.ErrorCode;
+import com.starrocks.common.Pair;
 import com.starrocks.persist.EditLog;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.ConnectScheduler;
@@ -35,10 +38,15 @@ import mockit.MockUp;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyShort;
@@ -51,6 +59,8 @@ import static org.mockito.Mockito.spy;
  * authentication failures, database switching, and error recovery.
  */
 public class MysqlProtoChangeUserTest {
+    private static final String MANAGED_USER = "flight_sql_ci";
+
     private ConnectContext context;
     private AuthenticationMgr authMgr;
 
@@ -107,6 +117,12 @@ public class MysqlProtoChangeUserTest {
                 .parse("create user user3 identified with mysql_native_password by ''", 32).get(0);
         Analyzer.analyze(createUser3, context);
         authMgr.createUser(createUser3);
+
+        CreateUserStmt createManagedUser = (CreateUserStmt) SqlParser
+                .parse("create user " + MANAGED_USER +
+                        " identified with mysql_native_password by 'managed_password'", 32).get(0);
+        Analyzer.analyze(createManagedUser, context);
+        authMgr.createUser(createManagedUser);
     }
 
     /**
@@ -148,6 +164,99 @@ public class MysqlProtoChangeUserTest {
         Assertions.assertEquals(originalUser, context.getQualifiedUser());
         Assertions.assertEquals(originalDb, context.getDatabase());
         Assertions.assertEquals(originalUserIdentity, context.getCurrentUserIdentity());
+    }
+
+    @Test
+    public void testChangeUserAuthenticationFailureRestoresCompleteState() throws IOException {
+        AuthenticationStateSnapshot previousState = setDistinctAuthenticationState();
+        context.getSessionVariable().setResourceGroup("original-resource-group");
+        ByteBuffer changeUserPacket = createChangeUserPacket("user1", "password1", null);
+
+        try (MockedStatic<AuthenticationHandler> authentication = Mockito.mockStatic(AuthenticationHandler.class)) {
+            authentication.when(() -> AuthenticationHandler.authenticate(
+                            any(ConnectContext.class), any(String.class), any(String.class), any(byte[].class)))
+                    .thenAnswer(invocation -> {
+                        mutateAuthenticationState(context);
+                        context.getSessionVariable().setResourceGroup("changed-resource-group");
+                        throw new AuthenticationException("authentication failed after partial context update");
+                    });
+
+            Assertions.assertFalse(MysqlProto.changeUser(context, changeUserPacket));
+        }
+
+        previousState.assertRestored(context);
+        Assertions.assertEquals("original-resource-group", context.getSessionVariable().getResourceGroup());
+    }
+
+    @Test
+    public void testChangeUserAuthenticationFailureRestoresNullState() throws IOException {
+        context.setCurrentUserIdentity(null);
+        context.setQualifiedUser(null);
+        context.setCurrentRoleIds((Set<Long>) null);
+        context.setGroups(null);
+        context.setSecurityIntegration(null);
+        context.setDistinguishedName(null);
+        AuthenticationStateSnapshot previousState = AuthenticationStateSnapshot.capture(context);
+        ByteBuffer changeUserPacket = createChangeUserPacket("user1", "password1", null);
+
+        try (MockedStatic<AuthenticationHandler> authentication = Mockito.mockStatic(AuthenticationHandler.class)) {
+            authentication.when(() -> AuthenticationHandler.authenticate(
+                            any(ConnectContext.class), any(String.class), any(String.class), any(byte[].class)))
+                    .thenAnswer(invocation -> {
+                        mutateAuthenticationState(context);
+                        throw new AuthenticationException("authentication failed after partial context update");
+                    });
+
+            Assertions.assertFalse(MysqlProto.changeUser(context, changeUserPacket));
+        }
+
+        previousState.assertRestored(context);
+    }
+
+    @Test
+    public void testChangeUserFromRangerManagedUserIsDeniedAndRestored() throws Exception {
+        context.setQualifiedUser(MANAGED_USER);
+        context.setCurrentUserIdentity(new UserIdentity(MANAGED_USER, "%"));
+        AuthenticationStateSnapshot previousState = setDistinctAuthenticationState();
+        context.getSessionVariable().setResourceGroup("managed-resource-group");
+        context.getSessionVariable().setQueryTimeoutS(37);
+        authMgr.updateUserProperty("user1", List.of(Pair.create("session.query_timeout", "123")));
+        ByteBuffer changeUserPacket = createChangeUserPacket("user1", "password1", null);
+
+        try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class)) {
+            authorizer.when(() -> Authorizer.isRangerManagedContext(context))
+                    .thenAnswer(invocation -> MANAGED_USER.equals(context.getQualifiedUser()));
+
+            Assertions.assertFalse(MysqlProto.changeUser(context, changeUserPacket));
+        }
+
+        previousState.assertRestored(context);
+        Assertions.assertEquals("managed-resource-group", context.getSessionVariable().getResourceGroup());
+        Assertions.assertEquals(37, context.getSessionVariable().getQueryTimeoutS());
+        Assertions.assertEquals(ErrorCode.ERR_ACCESS_DENIED_FOR_EXTERNAL_ACCESS_CONTROLLER,
+                context.getState().getErrorCode());
+    }
+
+    @Test
+    public void testChangeUserToRangerManagedUserIsDeniedAndRestored() throws Exception {
+        AuthenticationStateSnapshot previousState = setDistinctAuthenticationState();
+        context.getSessionVariable().setResourceGroup("ordinary-resource-group");
+        context.getSessionVariable().setQueryTimeoutS(41);
+        authMgr.updateUserProperty(MANAGED_USER, List.of(Pair.create("session.query_timeout", "321")));
+        ByteBuffer changeUserPacket = createChangeUserPacket(MANAGED_USER, "managed_password", null);
+
+        try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class)) {
+            authorizer.when(() -> Authorizer.isRangerManagedContext(context))
+                    .thenAnswer(invocation -> MANAGED_USER.equals(context.getQualifiedUser()));
+
+            Assertions.assertFalse(MysqlProto.changeUser(context, changeUserPacket));
+        }
+
+        previousState.assertRestored(context);
+        Assertions.assertEquals("ordinary-resource-group", context.getSessionVariable().getResourceGroup());
+        Assertions.assertEquals(41, context.getSessionVariable().getQueryTimeoutS());
+        Assertions.assertEquals(ErrorCode.ERR_ACCESS_DENIED_FOR_EXTERNAL_ACCESS_CONTROLLER,
+                context.getState().getErrorCode());
     }
 
     /**
@@ -198,6 +307,8 @@ public class MysqlProtoChangeUserTest {
             }
         };
         
+        AuthenticationStateSnapshot previousState = setDistinctAuthenticationState();
+
         // Save original user info for verification
         String originalUser = context.getQualifiedUser();
         String originalDb = context.getDatabase();
@@ -211,6 +322,7 @@ public class MysqlProtoChangeUserTest {
         Assertions.assertEquals(originalUser, context.getQualifiedUser());
         Assertions.assertEquals(originalDb, context.getDatabase());
         Assertions.assertEquals(originalUserIdentity, context.getCurrentUserIdentity());
+        previousState.assertRestored(context);
     }
 
     /**
@@ -238,6 +350,8 @@ public class MysqlProtoChangeUserTest {
             }
         };
         
+        AuthenticationStateSnapshot previousState = setDistinctAuthenticationState();
+
         // Save original user info for verification
         String originalUser = context.getQualifiedUser();
         String originalDb = context.getDatabase();
@@ -251,6 +365,7 @@ public class MysqlProtoChangeUserTest {
         Assertions.assertEquals(originalUser, context.getQualifiedUser());
         Assertions.assertEquals(originalDb, context.getDatabase());
         Assertions.assertEquals(originalUserIdentity, context.getCurrentUserIdentity());
+        previousState.assertRestored(context);
         Assertions.assertEquals(ErrorCode.ERR_TOO_MANY_USER_CONNECTIONS, context.getState().getErrorCode());
     }
 
@@ -438,5 +553,46 @@ public class MysqlProtoChangeUserTest {
         serializer.writeNulTerminateString("");
         
         return serializer.toByteBuffer();
+    }
+
+    private AuthenticationStateSnapshot setDistinctAuthenticationState() {
+        context.setCurrentRoleIds(new HashSet<>(Set.of(101L, 102L)));
+        context.setGroups(new HashSet<>(Set.of("original-group")));
+        context.setSecurityIntegration("original-security-integration");
+        context.setDistinguishedName("original-distinguished-name");
+        return AuthenticationStateSnapshot.capture(context);
+    }
+
+    private static void mutateAuthenticationState(ConnectContext context) {
+        context.setCurrentUserIdentity(new UserIdentity("changed-user", "changed-host"));
+        context.setQualifiedUser("changed-user");
+        context.setCurrentRoleIds(new HashSet<>(Set.of(999L)));
+        context.setGroups(new HashSet<>(Set.of("changed-group")));
+        context.setSecurityIntegration("changed-security-integration");
+        context.setDistinguishedName("changed-distinguished-name");
+    }
+
+    private record AuthenticationStateSnapshot(UserIdentity currentUserIdentity, String qualifiedUser,
+                                               Set<Long> currentRoleIds, Set<String> groups,
+                                               String securityIntegration, String distinguishedName) {
+        private static AuthenticationStateSnapshot capture(ConnectContext context) {
+            return new AuthenticationStateSnapshot(
+                    context.getCurrentUserIdentity(), context.getQualifiedUser(),
+                    copySet(context.getCurrentRoleIds()), copySet(context.getGroups()),
+                    context.getSecurityIntegration(), context.getDistinguishedName());
+        }
+
+        private void assertRestored(ConnectContext context) {
+            Assertions.assertEquals(currentUserIdentity, context.getCurrentUserIdentity());
+            Assertions.assertEquals(qualifiedUser, context.getQualifiedUser());
+            Assertions.assertEquals(currentRoleIds, context.getCurrentRoleIds());
+            Assertions.assertEquals(groups, context.getGroups());
+            Assertions.assertEquals(securityIntegration, context.getSecurityIntegration());
+            Assertions.assertEquals(distinguishedName, context.getDistinguishedName());
+        }
+
+        private static <T> Set<T> copySet(Set<T> values) {
+            return values == null ? null : new HashSet<>(values);
+        }
     }
 }

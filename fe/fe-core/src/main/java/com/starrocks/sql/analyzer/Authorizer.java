@@ -56,25 +56,31 @@ public class Authorizer {
         return GlobalStateMgr.getCurrentState().getAuthorizer().accessControlProvider;
     }
 
+    public static boolean isRangerManagedContext(ConnectContext context) {
+        return getInstance().isRangerManagedContext(context);
+    }
+
     public static void check(StatementBase statement, ConnectContext context) {
-        getInstance().getPrivilegeCheckerVisitor().check(statement, context);
+        AccessControlProvider accessControlProvider = getInstance();
+        accessControlProvider.validateAccessControlContext(context);
+        accessControlProvider.getPrivilegeCheckerVisitor().check(statement, context);
     }
 
     public static void checkSystemAction(ConnectContext context, PrivilegeType privilegeType)
             throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkSystemAction(context, privilegeType);
     }
 
     public static void checkUserAction(ConnectContext context, UserIdentity impersonateUser,
                                        PrivilegeType privilegeType) throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkUserAction(context, impersonateUser, privilegeType);
     }
 
     public static void checkCatalogAction(ConnectContext context, String catalogName,
                                           PrivilegeType privilegeType) throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkCatalogAction(context, catalogName, privilegeType);
     }
 
@@ -82,20 +88,20 @@ public class Authorizer {
             throws AccessDeniedException {
         //Any user has an implicit usage permission on the internal catalog
         if (!CatalogMgr.isInternalCatalog(catalogName)) {
-            getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+            getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                     .checkAnyActionOnCatalog(context, catalogName);
         }
     }
 
     public static void checkDbAction(ConnectContext context, String catalogName, String db,
                                      PrivilegeType privilegeType) throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(catalogName)
+        getInstance().getAccessControlOrDefault(catalogName, context)
                 .checkDbAction(context, catalogName, db, privilegeType);
     }
 
     public static void checkAnyActionOnDb(ConnectContext context, String catalogName, String db)
             throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(catalogName).checkAnyActionOnDb(context, catalogName, db);
+        getInstance().getAccessControlOrDefault(catalogName, context).checkAnyActionOnDb(context, catalogName, db);
     }
 
     public static void checkTableAction(ConnectContext context, String db, String table,
@@ -105,7 +111,7 @@ public class Authorizer {
         if (tableObj.isPresent() && !tableObj.get().isTable() && privilegeType.equals(PrivilegeType.INSERT)) {
             return;
         }
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkTableAction(context,
                         new TableName(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, db, table), privilegeType);
     }
@@ -117,7 +123,7 @@ public class Authorizer {
         if (tableObj.isPresent() && !tableObj.get().isTable() && privilegeType.equals(PrivilegeType.INSERT)) {
             return;
         }
-        getInstance().getAccessControlOrDefault(catalog).checkTableAction(context,
+        getInstance().getAccessControlOrDefault(catalog, context).checkTableAction(context,
                 new TableName(catalog, db, table), privilegeType);
     }
 
@@ -128,44 +134,44 @@ public class Authorizer {
             return;
         }
         String catalog = tableName.getCatalog();
-        getInstance().getAccessControlOrDefault(catalog)
+        getInstance().getAccessControlOrDefault(catalog, context)
                 .checkTableAction(context, tableName, privilegeType);
     }
 
     public static void checkAnyActionOnTable(ConnectContext context, TableName tableName)
             throws AccessDeniedException {
         String catalog = tableName.getCatalog();
-        getInstance().getAccessControlOrDefault(catalog).checkAnyActionOnTable(context, tableName);
+        getInstance().getAccessControlOrDefault(catalog, context).checkAnyActionOnTable(context, tableName);
     }
 
     public static void checkColumnAction(ConnectContext context,
                                          TableName tableName, String column,
                                          PrivilegeType privilegeType) throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(tableName.getCatalog()).checkColumnAction(context,
+        getInstance().getAccessControlOrDefault(tableName.getCatalog(), context).checkColumnAction(context,
                 tableName, column, privilegeType);
     }
 
     public static void checkViewAction(ConnectContext context, TableName tableName,
                                        PrivilegeType privilegeType) throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkViewAction(context, tableName, privilegeType);
     }
 
     public static void checkAnyActionOnView(ConnectContext context, TableName tableName)
             throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkAnyActionOnView(context, tableName);
     }
 
     public static void checkMaterializedViewAction(ConnectContext context, TableName tableName,
                                                    PrivilegeType privilegeType) throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkMaterializedViewAction(context, tableName, privilegeType);
     }
 
     public static void checkAnyActionOnMaterializedView(ConnectContext context,
                                                         TableName tableName) throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkAnyActionOnMaterializedView(context, tableName);
     }
 
@@ -261,31 +267,31 @@ public class Authorizer {
 
     public static void checkFunctionAction(ConnectContext context, Database database,
                                            Function function, PrivilegeType privilegeType) throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkFunctionAction(context, database, function, privilegeType);
     }
 
     public static void checkAnyActionOnFunction(ConnectContext context, String database, Function function)
             throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkAnyActionOnFunction(context, database, function);
     }
 
     public static void checkGlobalFunctionAction(ConnectContext context, Function function,
                                                  PrivilegeType privilegeType) throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkGlobalFunctionAction(context, function, privilegeType);
     }
 
     public static void checkAnyActionOnGlobalFunction(ConnectContext context, Function function)
             throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkAnyActionOnGlobalFunction(context, function);
     }
 
     public static void checkActionInDb(ConnectContext context, String db, PrivilegeType privilegeType)
             throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkActionInDb(context, db, privilegeType);
     }
 
@@ -304,7 +310,7 @@ public class Authorizer {
     public static void checkAnyActionOnOrInDb(ConnectContext context, String catalogName, String db)
             throws AccessDeniedException {
         Preconditions.checkNotNull(db, "db should not null");
-        AccessController controller = getInstance().getAccessControlOrDefault(catalogName);
+        AccessController controller = getInstance().getAccessControlOrDefault(catalogName, context);
 
         List<AccessControlChecker> basicCheckers = ImmutableList.of(
                 () -> controller.checkAnyActionOnDb(context, catalogName, db),
@@ -335,62 +341,62 @@ public class Authorizer {
 
     public static void checkResourceAction(ConnectContext context, String name,
                                            PrivilegeType privilegeType) throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkResourceAction(context, name, privilegeType);
     }
 
     public static void checkAnyActionOnResource(ConnectContext context, String name)
             throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkAnyActionOnResource(context, name);
     }
 
     public static void checkResourceGroupAction(ConnectContext context, String name,
                                                 PrivilegeType privilegeType) throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkResourceGroupAction(context, name, privilegeType);
     }
 
     public static void checkPipeAction(ConnectContext context, PipeName name,
                                        PrivilegeType privilegeType) throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkPipeAction(context, name, privilegeType);
     }
 
     public static void checkAnyActionOnPipe(ConnectContext context, PipeName name)
             throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkAnyActionOnPipe(context, name);
     }
 
     public static void checkStorageVolumeAction(ConnectContext context, String storageVolume,
                                                 PrivilegeType privilegeType) throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkStorageVolumeAction(context, storageVolume, privilegeType);
     }
 
     public static void checkAnyActionOnStorageVolume(ConnectContext context, String storageVolume)
             throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkAnyActionOnStorageVolume(context, storageVolume);
     }
 
     public static void withGrantOption(ConnectContext context, ObjectType type, List<PrivilegeType> wants,
                                        List<PEntryObject> objects) throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME).
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context).
                 withGrantOption(context, type, wants, objects);
     }
 
     public static Map<String, Expr> getColumnMaskingPolicy(ConnectContext currentUser, TableName tableName,
                                                            List<Column> columns) {
         String catalog = tableName.getCatalog() == null ? InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME : tableName.getCatalog();
-        return getInstance().getAccessControlOrDefault(catalog)
+        return getInstance().getAccessControlOrDefault(catalog, currentUser)
                 .getColumnMaskingPolicy(currentUser, tableName, columns);
     }
 
     public static Expr getRowAccessPolicy(ConnectContext currentUser, TableName tableName) {
         String catalog = tableName.getCatalog() == null ? InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME : tableName.getCatalog();
-        return getInstance().getAccessControlOrDefault(catalog).getRowAccessPolicy(currentUser, tableName);
+        return getInstance().getAccessControlOrDefault(catalog, currentUser).getRowAccessPolicy(currentUser, tableName);
     }
 
     /**
@@ -419,7 +425,7 @@ public class Authorizer {
 
     public static void checkWarehouseAction(ConnectContext context, String name,
                                             PrivilegeType privilegeType) throws AccessDeniedException {
-        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+        getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                 .checkWarehouseAction(context, name, privilegeType);
     }
 
@@ -428,7 +434,7 @@ public class Authorizer {
         // Any user has an implicit usage permission on the default_warehouse
         Warehouse warehouse = GlobalStateMgr.getCurrentState().getWarehouseMgr().getWarehouse(name);
         if (warehouse.getId() != WarehouseManager.DEFAULT_WAREHOUSE_ID) {
-            getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)
+            getInstance().getAccessControlOrDefault(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, context)
                     .checkAnyActionOnWarehouse(context, name);
         }
     }

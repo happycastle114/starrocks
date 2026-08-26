@@ -3779,8 +3779,13 @@ public class Config extends ConfigBase {
     @ConfField(mutable = true)
     public static int primary_key_disk_schedule_time = 3600; // 1h
 
-    @ConfField(mutable = true)
+    @ConfField(comment = "Access control mode. Supported values: native, ranger, hybrid_ranger_users. " +
+            "This configuration requires an FE restart to take effect.")
     public static String access_control = "native";
+
+    @ConfField(comment = "Exact, comma-separated authenticated user names governed by Ranger when " +
+            "access_control is hybrid_ranger_users. This configuration requires an FE restart to take effect.")
+    public static String[] ranger_managed_users = {};
 
     /**
      * Whether to use the unix group as the ranger authentication group

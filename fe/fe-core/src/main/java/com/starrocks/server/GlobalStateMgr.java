@@ -855,10 +855,22 @@ public class GlobalStateMgr {
         this.sqlParser = new SqlParser(AstBuilder.getInstance());
         this.analyzer = new Analyzer(Analyzer.AnalyzerVisitor.getInstance());
         AccessControlProvider accessControlProvider;
-        if (Config.access_control.equals("ranger")) {
-            accessControlProvider = new AccessControlProvider(new AuthorizerStmtVisitor(), new RangerStarRocksAccessController());
-        } else {
-            accessControlProvider = new AccessControlProvider(new AuthorizerStmtVisitor(), new NativeAccessController());
+        switch (Config.access_control) {
+            case "native":
+                accessControlProvider =
+                        new AccessControlProvider(new AuthorizerStmtVisitor(), new NativeAccessController());
+                break;
+            case "ranger":
+                accessControlProvider = new AccessControlProvider(
+                        new AuthorizerStmtVisitor(), new RangerStarRocksAccessController());
+                break;
+            case "hybrid_ranger_users":
+                accessControlProvider = new AccessControlProvider(
+                        new AuthorizerStmtVisitor(), new NativeAccessController(),
+                        new RangerStarRocksAccessController(), Config.ranger_managed_users);
+                break;
+            default:
+                throw new IllegalArgumentException("Unsupported access_control mode: " + Config.access_control);
         }
         this.authorizer = new Authorizer(accessControlProvider);
         this.ddlStmtExecutor = new DDLStmtExecutor(DDLStmtExecutor.StmtExecutorVisitor.getInstance());

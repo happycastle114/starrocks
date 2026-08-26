@@ -17,6 +17,7 @@ package com.starrocks.authorization;
 import com.starrocks.catalog.InternalCatalog;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReportException;
+import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.ast.UserIdentity;
@@ -39,7 +40,7 @@ public class AccessDeniedException extends Exception {
             catalog = InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME;
         }
 
-        if (Authorizer.getInstance().getAccessControlOrDefault(catalog) instanceof
+        if (Authorizer.getInstance().getAccessControlOrDefault(catalog, ConnectContext.get()) instanceof
                 ExternalAccessController) {
             throw ErrorReportException.report(ErrorCode.ERR_ACCESS_DENIED_FOR_EXTERNAL_ACCESS_CONTROLLER,
                     privilegeType, objectType, object == null ? "" : " " + object);

@@ -19,14 +19,19 @@ import com.starrocks.authentication.AuthenticationMgr;
 import com.starrocks.authentication.UserProperty;
 import com.starrocks.authorization.AuthorizationMgr;
 import com.starrocks.authorization.PrivilegeException;
+import com.starrocks.common.Config;
+import com.starrocks.common.DdlException;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.ExecuteAsExecutor;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.analyzer.Analyzer;
+import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.parser.AstBuilder;
 import com.starrocks.sql.parser.SqlParser;
 import mockit.Expectations;
+import mockit.Mock;
+import mockit.MockUp;
 import mockit.Mocked;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
@@ -54,11 +59,19 @@ public class ExecuteAsStmtTest {
         Analyzer analyzer = new Analyzer(Analyzer.AnalyzerVisitor.getInstance());
         new Expectations() {
             {
-                GlobalStateMgr.getCurrentState().getAuthenticationMgr();
+                GlobalStateMgr.getCurrentState();
+                minTimes = 0;
+                result = globalStateMgr;
+
+                globalStateMgr.getAuthenticationMgr();
                 minTimes = 0;
                 result = auth;
 
-                GlobalStateMgr.getCurrentState().getAuthorizationMgr().getDefaultRoleIdsByUser((UserIdentity) any);
+                globalStateMgr.getAuthorizationMgr();
+                minTimes = 0;
+                result = authorizationMgr;
+
+                authorizationMgr.getDefaultRoleIdsByUser((UserIdentity) any);
                 minTimes = 0;
                 result = new HashSet<>();
             }
@@ -148,5 +161,34 @@ public class ExecuteAsStmtTest {
             com.starrocks.sql.analyzer.Analyzer.analyze(stmt, ctx);
             Assertions.fail("No exception throws.");
         });
+    }
+
+    @Test
+    public void testRangerManagedUserCannotExecuteAs() {
+        String previousAccessControl = Config.access_control;
+        try {
+            Config.access_control = "hybrid_ranger_users";
+            new MockUp<Authorizer>() {
+                @Mock
+                public static boolean isRangerManagedContext(ConnectContext context) {
+                    return true;
+                }
+            };
+
+            UserIdentity[] targets = {
+                    new UserIdentity("flight_sql_ci", "%"),
+                    new UserIdentity("flight_sql_ci", "127.0.0.1"),
+                    new UserIdentity("ordinary", "%"),
+                    UserIdentity.ROOT
+            };
+            for (UserIdentity target : targets) {
+                DdlException exception = assertThrows(DdlException.class,
+                        () -> ExecuteAsExecutor.execute(new ExecuteAsStmt(target, false), ctx));
+                Assertions.assertEquals("EXECUTE AS is not allowed for Ranger-managed users",
+                        exception.getMessage());
+            }
+        } finally {
+            Config.access_control = previousAccessControl;
+        }
     }
 }
