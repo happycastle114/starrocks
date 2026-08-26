@@ -112,6 +112,8 @@ import com.starrocks.sql.ast.CreateStorageVolumeStmt;
 import com.starrocks.sql.ast.CreateTableAsSelectStmt;
 import com.starrocks.sql.ast.CreateTableLikeStmt;
 import com.starrocks.sql.ast.CreateTableStmt;
+import com.starrocks.sql.ast.CreateTemporaryTableLikeStmt;
+import com.starrocks.sql.ast.CreateTemporaryTableStmt;
 import com.starrocks.sql.ast.CreateViewStmt;
 import com.starrocks.sql.ast.DataCacheSelectStatement;
 import com.starrocks.sql.ast.DelBackendBlackListStmt;
@@ -217,6 +219,10 @@ import com.starrocks.sql.ast.UpdateStmt;
 import com.starrocks.sql.ast.UseCatalogStmt;
 import com.starrocks.sql.ast.UseDbStmt;
 import com.starrocks.sql.ast.UserIdentity;
+import com.starrocks.sql.ast.feedback.AddPlanAdvisorStmt;
+import com.starrocks.sql.ast.feedback.ClearPlanAdvisorStmt;
+import com.starrocks.sql.ast.feedback.DelPlanAdvisorStmt;
+import com.starrocks.sql.ast.feedback.ShowPlanAdvisorStmt;
 import com.starrocks.sql.ast.group.CreateGroupProviderStmt;
 import com.starrocks.sql.ast.group.DropGroupProviderStmt;
 import com.starrocks.sql.ast.group.ShowCreateGroupProviderStmt;
@@ -1738,6 +1744,41 @@ public class AuthorizerStmtVisitor implements AstVisitor<Void, ConnectContext> {
                     context.getCurrentUserIdentity(), context.getCurrentRoleIds(),
                     PrivilegeType.SELECT.name(), ObjectType.TABLE.name(), statement.getExistedDbTbl().getTbl());
         }
+        return null;
+    }
+
+    @Override
+    public Void visitCreateTemporaryTableStatement(CreateTemporaryTableStmt statement, ConnectContext context) {
+        return visitCreateTableStatement(statement, context);
+    }
+
+    @Override
+    public Void visitCreateTemporaryTableLikeStatement(
+            CreateTemporaryTableLikeStmt statement, ConnectContext context) {
+        return visitCreateTableLikeStatement(statement, context);
+    }
+
+    @Override
+    public Void visitAddPlanAdvisorStatement(AddPlanAdvisorStmt statement, ConnectContext context) {
+        Authorizer.checkSystemOperate(context);
+        return visitQueryStatement(statement.getQueryStmt(), context);
+    }
+
+    @Override
+    public Void visitClearPlanAdvisorStatement(ClearPlanAdvisorStmt statement, ConnectContext context) {
+        Authorizer.checkSystemOperate(context);
+        return null;
+    }
+
+    @Override
+    public Void visitDelPlanAdvisorStatement(DelPlanAdvisorStmt statement, ConnectContext context) {
+        Authorizer.checkSystemOperate(context);
+        return null;
+    }
+
+    @Override
+    public Void visitShowPlanAdvisorStatement(ShowPlanAdvisorStmt statement, ConnectContext context) {
+        Authorizer.checkSystemOperate(context);
         return null;
     }
 

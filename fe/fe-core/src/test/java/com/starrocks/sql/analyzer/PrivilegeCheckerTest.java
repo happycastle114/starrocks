@@ -68,10 +68,12 @@ import com.starrocks.qe.ShowExecutor;
 import com.starrocks.qe.ShowResultSet;
 import com.starrocks.qe.SqlModeHelper;
 import com.starrocks.qe.StmtExecutor;
+import com.starrocks.qe.feedback.PlanAdvisorExecutor;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.server.MetadataMgr;
 import com.starrocks.server.WarehouseManager;
 import com.starrocks.service.ExecuteEnv;
+import com.starrocks.sql.StatementPlanner;
 import com.starrocks.sql.ast.AstTraverser;
 import com.starrocks.sql.ast.CreateFunctionStmt;
 import com.starrocks.sql.ast.CreateMaterializedViewStatement;
@@ -151,6 +153,8 @@ public class PrivilegeCheckerTest extends StarRocksTestBase {
     @BeforeAll
     public static void beforeClass() throws Exception {
         FeConstants.runningUnitTest = true;
+        Config.proc_profile_cpu_enable = false;
+        Config.proc_profile_mem_enable = false;
         UtFrameUtils.createMinStarRocksCluster();
         UtFrameUtils.addMockBackend(10002);
         UtFrameUtils.addMockBackend(10003);
@@ -403,6 +407,106 @@ public class PrivilegeCheckerTest extends StarRocksTestBase {
         } catch (Exception e) {
             logSysInfo(e.getMessage() + ", sql: " + sql);
             Assertions.assertTrue(e.getMessage().contains(expectError1st));
+        }
+    }
+
+    @Test
+    public void testTemporaryTableAuthorizationBeforeMetadataResolution() throws Exception {
+        ConnectContext ctx = starRocksAssert.getCtx();
+        ctxToTestUser();
+
+        RuntimeException targetDenied = Assertions.assertThrows(RuntimeException.class,
+                () -> StatementPlanner.plan(SqlParser.parseSingleStatement(
+                        "create temporary table db3.tmp_auth (k1 int)",
+                        ctx.getSessionVariable().getSqlMode()), ctx));
+        Assertions.assertTrue(targetDenied.getMessage().contains("CREATE TABLE"), targetDenied.getMessage());
+        Assertions.assertFalse(targetDenied.getMessage().contains("Unknown database"), targetDenied.getMessage());
+
+        ctxToRoot();
+        grantOrRevoke("grant create table on database db1 to test");
+        try {
+            ctxToTestUser();
+            RuntimeException sourceDenied = Assertions.assertThrows(RuntimeException.class,
+                    () -> StatementPlanner.plan(SqlParser.parseSingleStatement(
+                            "create temporary table db1.tmp_auth like db1.tbl2",
+                            ctx.getSessionVariable().getSqlMode()), ctx));
+            Assertions.assertTrue(sourceDenied.getMessage().contains("SELECT"), sourceDenied.getMessage());
+            Assertions.assertFalse(sourceDenied.getMessage().contains("Unknown table"), sourceDenied.getMessage());
+
+            ctxToRoot();
+            grantOrRevoke("grant select on table db1.tbl1 to test");
+            try {
+                ctxToTestUser();
+                Assertions.assertDoesNotThrow(() -> StatementPlanner.plan(SqlParser.parseSingleStatement(
+                        "create temporary table db1.tmp_auth (k1 int)",
+                        ctx.getSessionVariable().getSqlMode()), ctx));
+                Assertions.assertDoesNotThrow(() -> StatementPlanner.plan(SqlParser.parseSingleStatement(
+                        "create temporary table db1.tmp_auth like db1.tbl1",
+                        ctx.getSessionVariable().getSqlMode()), ctx));
+                Assertions.assertDoesNotThrow(() -> StatementPlanner.plan(SqlParser.parseSingleStatement(
+                        "create temporary table db1.tmp_auth as select k1 from db1.tbl1",
+                        ctx.getSessionVariable().getSqlMode()), ctx));
+            } finally {
+                ctxToRoot();
+                grantOrRevoke("revoke select on table db1.tbl1 from test");
+            }
+        } finally {
+            ctxToRoot();
+            grantOrRevoke("revoke create table on database db1 from test");
+        }
+    }
+
+    @Test
+    public void testPlanAdvisorRequiresOperateBeforePlanningOrExecution() throws Exception {
+        ConnectContext ctx = starRocksAssert.getCtx();
+        String secretQuery = "alter plan advisor add select * from db1.plan_advisor_secret";
+        List<String> statements = List.of(
+                secretQuery,
+                "truncate plan advisor",
+                "alter plan advisor drop '00000000-0000-0000-0000-000000000000'",
+                "show plan advisor");
+
+        try (MockedStatic<PlanAdvisorExecutor> advisorExecutor = Mockito.mockStatic(PlanAdvisorExecutor.class)) {
+            for (String sql : statements) {
+                ctx.getState().reset();
+                ctxToTestUser();
+                new StmtExecutor(ctx, SqlParser.parseSingleStatement(
+                        sql, ctx.getSessionVariable().getSqlMode())).execute();
+                Assertions.assertTrue(ctx.getState().isError(), sql);
+                Assertions.assertTrue(ctx.getState().getErrorMessage().contains("OPERATE"),
+                        ctx.getState().getErrorMessage());
+                Assertions.assertFalse(ctx.getState().getErrorMessage().contains("plan_advisor_secret"),
+                        ctx.getState().getErrorMessage());
+            }
+            advisorExecutor.verifyNoInteractions();
+        }
+
+        ctxToRoot();
+        grantOrRevoke("grant operate on system to test");
+        try {
+            ctxToTestUser();
+            RuntimeException selectDenied = Assertions.assertThrows(RuntimeException.class,
+                    () -> StatementPlanner.plan(SqlParser.parseSingleStatement(
+                            "alter plan advisor add select * from db1.tbl1",
+                            ctx.getSessionVariable().getSqlMode()), ctx));
+            Assertions.assertTrue(selectDenied.getMessage().contains("SELECT"), selectDenied.getMessage());
+
+            ctxToRoot();
+            grantOrRevoke("grant select on table db1.tbl1 to test");
+            try {
+                ctxToTestUser();
+                Assertions.assertDoesNotThrow(() -> StatementPlanner.plan(SqlParser.parseSingleStatement(
+                        "alter plan advisor add select * from db1.tbl1",
+                        ctx.getSessionVariable().getSqlMode()), ctx));
+                Assertions.assertDoesNotThrow(() -> StatementPlanner.plan(SqlParser.parseSingleStatement(
+                        "show plan advisor", ctx.getSessionVariable().getSqlMode()), ctx));
+            } finally {
+                ctxToRoot();
+                grantOrRevoke("revoke select on table db1.tbl1 from test");
+            }
+        } finally {
+            ctxToRoot();
+            grantOrRevoke("revoke operate on system from test");
         }
     }
 

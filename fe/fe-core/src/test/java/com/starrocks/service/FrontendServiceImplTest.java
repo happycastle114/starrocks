@@ -1212,8 +1212,6 @@ public class FrontendServiceImplTest {
         ConnectContext ctx = starRocksAssert.getCtx();
         String createUserSql = "create user test4";
         DDLStmtExecutor.execute(UtFrameUtils.parseStmtWithNewParser(createUserSql, ctx), ctx);
-        String grantSql = "GRANT SELECT ON TABLE test_table.base1 TO USER `test4`@`%`;";
-        DDLStmtExecutor.execute(UtFrameUtils.parseStmtWithNewParser(grantSql, ctx), ctx);
 
         FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
         TGetTablesParams request = new TGetTablesParams();
@@ -1226,7 +1224,20 @@ public class FrontendServiceImplTest {
         request.setDb("test_table");
         request.setType(TTableType.MATERIALIZED_VIEW);
         TListMaterializedViewStatusResult response = impl.listMaterializedViewStatus(request);
+        Assertions.assertEquals(0, response.materialized_views.size());
+
+        String grantSql = "GRANT SELECT ON TABLE test_table.base1 TO USER `test4`@`%`;";
+        DDLStmtExecutor.execute(UtFrameUtils.parseStmtWithNewParser(grantSql, ctx), ctx);
+        response = impl.listMaterializedViewStatus(request);
         Assertions.assertEquals(1, response.materialized_views.size());
+
+        request.setTable_name("mv$test");
+        response = impl.listMaterializedViewStatus(request);
+        Assertions.assertEquals(1, response.materialized_views.size());
+
+        request.setTable_name("base1");
+        response = impl.listMaterializedViewStatus(request);
+        Assertions.assertEquals(0, response.materialized_views.size());
     }
 
     @Test

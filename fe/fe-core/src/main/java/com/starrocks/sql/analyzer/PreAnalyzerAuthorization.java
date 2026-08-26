@@ -26,6 +26,8 @@ import com.starrocks.sql.ast.CreateFunctionStmt;
 import com.starrocks.sql.ast.CreateMaterializedViewStatement;
 import com.starrocks.sql.ast.CreateMaterializedViewStmt;
 import com.starrocks.sql.ast.CreateTableAsSelectStmt;
+import com.starrocks.sql.ast.CreateTemporaryTableLikeStmt;
+import com.starrocks.sql.ast.CreateTemporaryTableStmt;
 import com.starrocks.sql.ast.CreateViewStmt;
 import com.starrocks.sql.ast.DeleteStmt;
 import com.starrocks.sql.ast.DmlStmt;
@@ -38,6 +40,7 @@ import com.starrocks.sql.ast.SubmitTaskStmt;
 import com.starrocks.sql.ast.TableRelation;
 import com.starrocks.sql.ast.UpdateStmt;
 import com.starrocks.sql.ast.UserVariable;
+import com.starrocks.sql.ast.feedback.PlanAdvisorStmt;
 import com.starrocks.sql.ast.pipe.CreatePipeStmt;
 
 public final class PreAnalyzerAuthorization {
@@ -57,6 +60,9 @@ public final class PreAnalyzerAuthorization {
         }
 
         checkRangerManagedQuery(statement, session);
+        if (authorizeMetadataControlBefore(statement, session)) {
+            return Result.NONE;
+        }
         if (statement instanceof DmlStmt dmlStmt && shouldAuthorizeDmlTarget(dmlStmt)) {
             dmlStmt.getTableName().normalization(session);
             return authorizeDmlTarget(dmlStmt, session);
@@ -117,6 +123,46 @@ public final class PreAnalyzerAuthorization {
         }
         Authorizer.checkRangerManagedExpressionBeforeAnalysis(
                 userVariable.getUnevaluatedExpression(), session);
+    }
+
+    private static boolean authorizeMetadataControlBefore(
+            StatementBase statement, ConnectContext session) {
+        if (!(statement instanceof CreateTemporaryTableStmt)
+                && !(statement instanceof PlanAdvisorStmt)) {
+            return false;
+        }
+
+        Authorizer.getInstance().validateAccessControlContext(session);
+        if (statement instanceof CreateTemporaryTableLikeStmt createLike) {
+            checkCreateTemporaryTableTarget(createLike.getDbTbl(), session);
+            checkCreateTemporaryTableSource(createLike.getExistedDbTbl(), session);
+        } else if (statement instanceof CreateTemporaryTableStmt createTemporaryTable) {
+            checkCreateTemporaryTableTarget(createTemporaryTable.getDbTbl(), session);
+        } else {
+            Authorizer.checkSystemOperate(session);
+        }
+        return true;
+    }
+
+    private static void checkCreateTemporaryTableTarget(
+            TableName target, ConnectContext session) {
+        TableName resolvedTarget = resolveTableName(target, session);
+        checkDbTargetAction(resolvedTarget, PrivilegeType.CREATE_TABLE, session);
+    }
+
+    private static void checkCreateTemporaryTableSource(
+            TableName source, ConnectContext session) {
+        TableName resolvedSource = resolveTableName(source, session);
+        checkTableTargetActionByName(resolvedSource, PrivilegeType.SELECT, session);
+    }
+
+    private static TableName resolveTableName(
+            TableName tableName, ConnectContext session) {
+        String catalog = tableName.getCatalog() == null
+                ? session.getCurrentCatalog() : tableName.getCatalog();
+        String db = tableName.getDb() == null
+                ? session.getDatabase() : tableName.getDb();
+        return new TableName(catalog, db, tableName.getTbl());
     }
 
     public static void checkRangerManagedQuery(

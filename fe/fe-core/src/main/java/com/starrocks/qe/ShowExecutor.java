@@ -404,6 +404,11 @@ public class ShowExecutor {
                         materializedViews.add(mvTable);
                     } else if (table.isOlapOrCloudNativeTable()) {
                         OlapTable olapTable = (OlapTable) table;
+                        try {
+                            Authorizer.checkAnyActionOnTableLikeObject(context, dbName, olapTable);
+                        } catch (AccessDeniedException e) {
+                            continue;
+                        }
                         List<MaterializedIndexMeta> visibleMaterializedViews = olapTable.getVisibleIndexMetas();
                         long baseIdx = olapTable.getBaseIndexId();
                         for (MaterializedIndexMeta mvMeta : visibleMaterializedViews) {

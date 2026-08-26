@@ -152,6 +152,7 @@ import com.starrocks.sql.ast.UninstallPluginStmt;
 import com.starrocks.sql.ast.UpdateStmt;
 import com.starrocks.sql.ast.UseCatalogStmt;
 import com.starrocks.sql.ast.UseDbStmt;
+import com.starrocks.sql.ast.feedback.AddPlanAdvisorStmt;
 import com.starrocks.sql.ast.group.CreateGroupProviderStmt;
 import com.starrocks.sql.ast.group.DropGroupProviderStmt;
 import com.starrocks.sql.ast.group.ShowCreateGroupProviderStmt;
@@ -246,6 +247,12 @@ public class Analyzer {
         @Override
         public Void visitCreateTemporaryTableLikeStatement(CreateTemporaryTableLikeStmt statement, ConnectContext context) {
             CreateTableLikeAnalyzer.analyze(statement, context);
+            return null;
+        }
+
+        @Override
+        public Void visitAddPlanAdvisorStatement(AddPlanAdvisorStmt statement, ConnectContext context) {
+            visitQueryStatement(statement.getQueryStmt(), context);
             return null;
         }
 

@@ -294,16 +294,18 @@ public class MaterializedViewsSystemTable extends SystemTable {
     private static void filterSynchronousMaterializedView(
             OlapTable olapTable,
             PatternMatcher matcher,
+            ConnectContext context,
+            String dbName,
             TGetTablesParams params,
             List<Pair<OlapTable, MaterializedIndexMeta>> singleTableMVs) {
-        // synchronized materialized view metadata size should be greater than 1.
-        if (olapTable.getVisibleIndexMetas().size() <= 1) {
+        try {
+            Authorizer.checkAnyActionOnTableLikeObject(context, dbName, olapTable);
+        } catch (AccessDeniedException e) {
             return;
         }
 
-        // check table name
-        String mvName = params.table_name;
-        if (mvName != null && !mvName.equalsIgnoreCase(olapTable.getName())) {
+        // synchronized materialized view metadata size should be greater than 1.
+        if (olapTable.getVisibleIndexMetas().size() <= 1) {
             return;
         }
 
@@ -315,7 +317,11 @@ public class MaterializedViewsSystemTable extends SystemTable {
                 continue;
             }
 
-            if (!PatternMatcher.matchPattern(params.getPattern(), olapTable.getIndexNameById(mvMeta.getIndexId()),
+            String mvName = olapTable.getIndexNameById(mvMeta.getIndexId());
+            if (params.table_name != null && !params.table_name.equalsIgnoreCase(mvName)) {
+                continue;
+            }
+            if (!PatternMatcher.matchPattern(params.getPattern(), mvName,
                     matcher, caseSensitive)) {
                 continue;
             }
@@ -337,7 +343,8 @@ public class MaterializedViewsSystemTable extends SystemTable {
                 filterAsynchronousMaterializedView(matcher, context, dbName,
                         (MaterializedView) table, params, materializedViews);
             } else if (table.getType() == Table.TableType.OLAP) {
-                filterSynchronousMaterializedView((OlapTable) table, matcher, params, singleTableMVs);
+                filterSynchronousMaterializedView(
+                        (OlapTable) table, matcher, context, dbName, params, singleTableMVs);
             } else {
                 // continue
             }

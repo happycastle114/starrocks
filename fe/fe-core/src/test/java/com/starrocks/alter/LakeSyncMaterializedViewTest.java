@@ -25,12 +25,14 @@ import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.Pair;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.qe.DDLStmtExecutor;
 import com.starrocks.qe.ShowResultSet;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.server.RunMode;
 import com.starrocks.sql.ast.CreateMaterializedViewStmt;
 import com.starrocks.sql.ast.ShowMaterializedViewsStmt;
 import com.starrocks.sql.ast.StatementBase;
+import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.sql.plan.ExecPlan;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.StarRocksTestBase;
@@ -223,7 +225,42 @@ public class LakeSyncMaterializedViewTest extends StarRocksTestBase {
                 connectContext);
 
         Assertions.assertEquals(1, result.getResultRows().size());
-        starRocksAssert.dropMaterializedView("sync_mv1");
+
+        try {
+            UserIdentity visibilityUser =
+                    UserIdentity.createAnalyzedUserIdentWithIp("sync_mv_visibility_user", "%");
+            starRocksAssert.withUser("sync_mv_visibility_user");
+            connectContext.setCurrentUserIdentity(visibilityUser);
+            connectContext.setCurrentRoleIds(
+                    GlobalStateMgr.getCurrentState().getAuthorizationMgr().getRoleIdsByUser(visibilityUser));
+
+            result = GlobalStateMgr.getCurrentState().getShowExecutor().execute(showMaterializedViewsStmt, connectContext);
+            Assertions.assertEquals(0, result.getResultRows().size());
+
+            connectContext.setCurrentUserIdentity(UserIdentity.ROOT);
+            connectContext.setCurrentRoleIds(
+                    GlobalStateMgr.getCurrentState().getAuthorizationMgr().getRoleIdsByUser(UserIdentity.ROOT));
+            DDLStmtExecutor.execute(UtFrameUtils.parseStmtWithNewParser(
+                    "grant select on table test.tbl1 to sync_mv_visibility_user", connectContext), connectContext);
+
+            connectContext.setCurrentUserIdentity(visibilityUser);
+            connectContext.setCurrentRoleIds(
+                    GlobalStateMgr.getCurrentState().getAuthorizationMgr().getRoleIdsByUser(visibilityUser));
+            ShowMaterializedViewsStmt patternStmt = new ShowMaterializedViewsStmt(
+                    "default_catalog", "test", "sync_mv1");
+            result = GlobalStateMgr.getCurrentState().getShowExecutor().execute(patternStmt, connectContext);
+            Assertions.assertEquals(1, result.getResultRows().size());
+
+            ShowMaterializedViewsStmt nonMatchingPatternStmt = new ShowMaterializedViewsStmt(
+                    "default_catalog", "test", "other%");
+            result = GlobalStateMgr.getCurrentState().getShowExecutor().execute(nonMatchingPatternStmt, connectContext);
+            Assertions.assertEquals(0, result.getResultRows().size());
+        } finally {
+            connectContext.setCurrentUserIdentity(UserIdentity.ROOT);
+            connectContext.setCurrentRoleIds(
+                    GlobalStateMgr.getCurrentState().getAuthorizationMgr().getRoleIdsByUser(UserIdentity.ROOT));
+            starRocksAssert.dropMaterializedView("sync_mv1");
+        }
     }
 
     @Test
