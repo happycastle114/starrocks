@@ -17,6 +17,7 @@ package com.starrocks.datacache;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.QualifiedName;
 import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -24,6 +25,11 @@ import java.util.Optional;
 
 public class DataCacheMgrTest {
     private final DataCacheMgr dataCacheMgr = DataCacheMgr.getInstance();
+
+    @BeforeEach
+    public void clearRules() {
+        dataCacheMgr.clearRules();
+    }
 
     @Test
     public void testAddCacheRule() {
@@ -35,11 +41,13 @@ public class DataCacheMgrTest {
         Optional<DataCacheRule> dataCacheRule = dataCacheMgr.getCacheRule("catalog", "db", "tbl");
         Assertions.assertTrue(dataCacheRule.isPresent());
         Assertions.assertEquals(-1, dataCacheRule.get().getPriority());
+        long firstRuleId = dataCacheRule.get().getId();
 
         QualifiedName conflictQualifiedName = QualifiedName.of(List.of("*", "*", "*"));
-        Assertions.assertThrows(SemanticException.class, () -> dataCacheMgr.throwExceptionIfRuleIsConflicted("*", "*", "*"));
+        Assertions.assertThrows(SemanticException.class,
+                () -> dataCacheMgr.createCacheRule(conflictQualifiedName, null, -1, null));
 
-        dataCacheMgr.dropCacheRule(0);
+        dataCacheMgr.dropCacheRule(firstRuleId);
         dataCacheMgr.createCacheRule(conflictQualifiedName, null, -1, null);
         dataCacheRule = dataCacheMgr.getCacheRule("a", "b", "c");
         Assertions.assertTrue(dataCacheRule.isPresent());
@@ -47,5 +55,23 @@ public class DataCacheMgrTest {
 
         Assertions.assertThrows(SemanticException.class, () -> dataCacheMgr
                 .throwExceptionIfRuleIsConflicted("a", "b", "c"));
+    }
+
+    @Test
+    public void testClearDoesNotReuseRuleId() {
+        QualifiedName firstTarget = QualifiedName.of(List.of("catalog", "db", "first"));
+        dataCacheMgr.createCacheRule(firstTarget, null, -1, null);
+        long firstRuleId = dataCacheMgr.getCacheRule(firstTarget).orElseThrow().getId();
+
+        dataCacheMgr.clearRules();
+
+        QualifiedName secondTarget = QualifiedName.of(List.of("catalog", "db", "second"));
+        dataCacheMgr.createCacheRule(secondTarget, null, -1, null);
+        DataCacheRule secondRule = dataCacheMgr.getCacheRule(secondTarget).orElseThrow();
+
+        Assertions.assertTrue(secondRule.getId() > firstRuleId);
+        Assertions.assertThrows(SemanticException.class,
+                () -> dataCacheMgr.dropCacheRule(firstRuleId));
+        Assertions.assertTrue(dataCacheMgr.getCacheRule(secondTarget).isPresent());
     }
 }

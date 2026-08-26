@@ -38,11 +38,11 @@ public class ClusterSnapshotAnalyzer {
     static class ClusterSnapshotAnalyzerVisitor implements AstVisitor<Void, ConnectContext> {
         @Override
         public Void visitAdminSetAutomatedSnapshotOnStatement(AdminSetAutomatedSnapshotOnStmt statement, ConnectContext context) {
+            checkSystemOperate(context);
             if (!RunMode.isSharedDataMode()) {
                 throw new SemanticException("Automated snapshot only support share data mode");
             }
 
-            checkSystemOperate(context);
             checkStorageVolumeUsage(context, statement.getStorageVolumeName());
 
             if (GlobalStateMgr.getCurrentState().getClusterSnapshotMgr().isAutomatedSnapshotOn()) {
@@ -76,11 +76,10 @@ public class ClusterSnapshotAnalyzer {
         @Override
         public Void visitAdminSetAutomatedSnapshotOffStatement(AdminSetAutomatedSnapshotOffStmt statement,
                                                                ConnectContext context) {
+            checkSystemOperate(context);
             if (!RunMode.isSharedDataMode()) {
                 throw new SemanticException("Automated snapshot only support share data mode");
             }
-
-            checkSystemOperate(context);
 
             if (!GlobalStateMgr.getCurrentState().getClusterSnapshotMgr().isAutomatedSnapshotOn()) {
                 throw new SemanticException("Automated snapshot has not been turn on");
@@ -92,11 +91,10 @@ public class ClusterSnapshotAnalyzer {
         @Override
         public Void visitAdminAlterAutomatedSnapshotIntervalStatement(AdminAlterAutomatedSnapshotIntervalStmt statement,
                                                                       ConnectContext context) {
+            checkSystemOperate(context);
             if (!RunMode.isSharedDataMode()) {
                 throw new SemanticException("Automated snapshot only support share data mode");
             }
-
-            checkSystemOperate(context);
 
             if (!GlobalStateMgr.getCurrentState().getClusterSnapshotMgr().isAutomatedSnapshotOn()) {
                 throw new SemanticException("Automated snapshot has not been turn on");

@@ -45,7 +45,6 @@ public class DataCacheMgr {
     public void clearRules() {
         writeLock();
         try {
-            ids.set(0);
             idToCacheRuleMap.clear();
             catalogMapping.clear();
         } finally {
@@ -58,6 +57,9 @@ public class DataCacheMgr {
         writeLock();
 
         try {
+            List<String> parts = target.getParts();
+            throwExceptionIfRuleIsConflictedWithoutLock(
+                    parts.get(0), parts.get(1), parts.get(2));
             long id  = ids.getAndIncrement();
             DataCacheRule cacheRule = new DataCacheRule(id, target, predicates, priority, properties);
             idToCacheRuleMap.put(id, cacheRule);
@@ -91,6 +93,10 @@ public class DataCacheMgr {
 
         try {
             DataCacheRule cacheRule = idToCacheRuleMap.remove(id);
+            if (cacheRule == null) {
+                throw new SemanticException(String.format(
+                        "DataCache rule id = %d does not exist", id));
+            }
             List<String> parts = cacheRule.getTarget().getParts();
             String catalogName = parts.get(0);
             String dbName = parts.get(1);
@@ -153,36 +159,44 @@ public class DataCacheMgr {
         readLock();
 
         try {
-            for (Map.Entry<Long, DataCacheRule> entry : idToCacheRuleMap.entrySet()) {
-                List<String> parts = entry.getValue().getTarget().getParts();
-                String catalog = parts.get(0);
-                if (isMatchAll(catalog) || isMatchAll(otherCatalog)) {
-                    throw new SemanticException(String.format("DataCache rule target's catalog name: %s is " +
-                            "conflict with existed rule: %s", otherCatalog, entry.getValue()));
-                }
-
-                if (!catalog.equals(otherCatalog)) {
-                    continue;
-                }
-
-                String db = parts.get(1);
-                if (isMatchAll(db) || isMatchAll(otherDb)) {
-                    throw new SemanticException(String.format("DataCache rule target's database name: %s is " +
-                            "conflict with existed rule %s", otherDb, entry.getValue()));
-                }
-
-                if (!db.equals(otherDb)) {
-                    continue;
-                }
-
-                String tbl = parts.get(2);
-                if (isMatchAll(tbl) || isMatchAll(otherTbl) || tbl.equals(otherTbl)) {
-                    throw new SemanticException(String.format("DataCache rule target's table name: %s " +
-                            "is conflict with existed rule %s", otherTbl, entry.getValue()));
-                }
-            }
+            throwExceptionIfRuleIsConflictedWithoutLock(otherCatalog, otherDb, otherTbl);
         } finally {
             readUnlock();
+        }
+    }
+
+    private void throwExceptionIfRuleIsConflictedWithoutLock(
+            String otherCatalog, String otherDb, String otherTbl) {
+        for (Map.Entry<Long, DataCacheRule> entry : idToCacheRuleMap.entrySet()) {
+            List<String> parts = entry.getValue().getTarget().getParts();
+            String catalog = parts.get(0);
+            if (isMatchAll(catalog) || isMatchAll(otherCatalog)) {
+                throw new SemanticException(String.format(
+                        "DataCache rule target's catalog name: %s is conflict with existed rule: %s",
+                        otherCatalog, entry.getValue()));
+            }
+
+            if (!catalog.equals(otherCatalog)) {
+                continue;
+            }
+
+            String db = parts.get(1);
+            if (isMatchAll(db) || isMatchAll(otherDb)) {
+                throw new SemanticException(String.format(
+                        "DataCache rule target's database name: %s is conflict with existed rule %s",
+                        otherDb, entry.getValue()));
+            }
+
+            if (!db.equals(otherDb)) {
+                continue;
+            }
+
+            String tbl = parts.get(2);
+            if (isMatchAll(tbl) || isMatchAll(otherTbl) || tbl.equals(otherTbl)) {
+                throw new SemanticException(String.format(
+                        "DataCache rule target's table name: %s is conflict with existed rule %s",
+                        otherTbl, entry.getValue()));
+            }
         }
     }
 

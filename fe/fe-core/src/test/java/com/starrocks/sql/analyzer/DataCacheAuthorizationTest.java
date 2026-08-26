@@ -18,8 +18,11 @@ import com.starrocks.analysis.TableName;
 import com.starrocks.authorization.PrivilegeType;
 import com.starrocks.datacache.DataCacheMgr;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.qe.DDLStmtExecutor;
 import com.starrocks.qe.SessionVariable;
+import com.starrocks.qe.ShowExecutor;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.ShowDataCacheRulesStmt;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.parser.SqlParser;
 import org.junit.jupiter.api.Assertions;
@@ -33,6 +36,7 @@ public class DataCacheAuthorizationTest {
         ConnectContext context = new ConnectContext();
         StatementBase[] statements = new StatementBase[] {
                 parse("CREATE DATACACHE RULE *.*.* PRIORITY = -1"),
+                parse("SHOW DATACACHE RULES"),
                 parse("DROP DATACACHE RULE 7"),
                 parse("CLEAR DATACACHE RULES")};
 
@@ -48,6 +52,74 @@ public class DataCacheAuthorizationTest {
             }
 
             globalStateMgr.verifyNoInteractions();
+            dataCacheMgr.verifyNoInteractions();
+        }
+    }
+
+    @Test
+    public void testPartialWildcardsRequireConcreteScopeVisibility() {
+        ConnectContext context = new ConnectContext();
+        StatementBase catalogRule = parse(
+                "CREATE DATACACHE RULE hidden_catalog.*.* PRIORITY = -1");
+
+        try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class);
+                MockedStatic<GlobalStateMgr> globalStateMgr = Mockito.mockStatic(GlobalStateMgr.class);
+                MockedStatic<DataCacheMgr> dataCacheMgr = Mockito.mockStatic(DataCacheMgr.class)) {
+            authorizer.when(() -> Authorizer.checkAnyActionOnCatalog(context, "hidden_catalog"))
+                    .thenThrow(new SecurityException("hidden catalog"));
+
+            Assertions.assertThrows(SecurityException.class,
+                    () -> DataCacheStmtAnalyzer.analyze(catalogRule, context));
+
+            authorizer.verify(() -> Authorizer.checkSystemAction(context, PrivilegeType.OPERATE));
+            authorizer.verify(() -> Authorizer.checkAnyActionOnCatalog(context, "hidden_catalog"));
+            globalStateMgr.verifyNoInteractions();
+            dataCacheMgr.verifyNoInteractions();
+        }
+
+        StatementBase databaseRule = parse(
+                "CREATE DATACACHE RULE hidden_catalog.hidden_db.* PRIORITY = -1");
+        try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class);
+                MockedStatic<GlobalStateMgr> globalStateMgr = Mockito.mockStatic(GlobalStateMgr.class);
+                MockedStatic<DataCacheMgr> dataCacheMgr = Mockito.mockStatic(DataCacheMgr.class)) {
+            authorizer.when(() -> Authorizer.checkAnyActionOnOrInDb(
+                            context, "hidden_catalog", "hidden_db"))
+                    .thenThrow(new SecurityException("hidden database"));
+
+            Assertions.assertThrows(SecurityException.class,
+                    () -> DataCacheStmtAnalyzer.analyze(databaseRule, context));
+
+            authorizer.verify(() -> Authorizer.checkSystemAction(context, PrivilegeType.OPERATE));
+            authorizer.verify(() -> Authorizer.checkAnyActionOnOrInDb(
+                    context, "hidden_catalog", "hidden_db"));
+            globalStateMgr.verifyNoInteractions();
+            dataCacheMgr.verifyNoInteractions();
+        }
+    }
+
+    @Test
+    public void testExecutionSinksRecheckOperateBeforeRuleManagerAccess() {
+        ConnectContext context = new ConnectContext();
+        StatementBase[] mutations = new StatementBase[] {
+                parse("CREATE DATACACHE RULE *.*.* PRIORITY = -1"),
+                parse("DROP DATACACHE RULE 7"),
+                parse("CLEAR DATACACHE RULES")};
+        ShowDataCacheRulesStmt show = (ShowDataCacheRulesStmt) parse("SHOW DATACACHE RULES");
+
+        try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class);
+                MockedStatic<DataCacheMgr> dataCacheMgr = Mockito.mockStatic(DataCacheMgr.class)) {
+            authorizer.when(() -> Authorizer.checkSystemOperate(context))
+                    .thenThrow(new SecurityException("denied"));
+
+            DDLStmtExecutor.StmtExecutorVisitor ddlVisitor =
+                    DDLStmtExecutor.StmtExecutorVisitor.getInstance();
+            for (StatementBase mutation : mutations) {
+                Assertions.assertThrows(SecurityException.class,
+                        () -> mutation.accept(ddlVisitor, context));
+            }
+            Assertions.assertThrows(SecurityException.class,
+                    () -> show.accept(ShowExecutor.ShowExecutorVisitor.getInstance(), context));
+
             dataCacheMgr.verifyNoInteractions();
         }
     }

@@ -2588,6 +2588,7 @@ public class ShowExecutor {
 
         @Override
         public ShowResultSet visitShowDataCacheRulesStatement(ShowDataCacheRulesStmt statement, ConnectContext context) {
+            Authorizer.checkSystemOperate(context);
             return new ShowResultSet(showResultMetaFactory.getMetadata(statement),
                     DataCacheMgr.getInstance().getShowResultSetRows());
         }

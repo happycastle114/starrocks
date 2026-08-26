@@ -1213,6 +1213,7 @@ public class DDLStmtExecutor {
         // ==========================================Data Cache Management==============================================
         @Override
         public ShowResultSet visitCreateDataCacheRuleStatement(CreateDataCacheRuleStmt stmt, ConnectContext context) {
+            Authorizer.checkSystemOperate(context);
             ErrorReport.wrapWithRuntimeException(() -> {
                 DataCacheMgr.getInstance().createCacheRule(stmt.getTarget(), stmt.getPredicates(), stmt.getPriority(),
                         stmt.getProperties());
@@ -1222,6 +1223,7 @@ public class DDLStmtExecutor {
 
         @Override
         public ShowResultSet visitDropDataCacheRuleStatement(DropDataCacheRuleStmt stmt, ConnectContext context) {
+            Authorizer.checkSystemOperate(context);
             ErrorReport.wrapWithRuntimeException(() -> {
                 DataCacheMgr.getInstance().dropCacheRule(stmt.getCacheRuleId());
             });
@@ -1230,6 +1232,7 @@ public class DDLStmtExecutor {
 
         @Override
         public ShowResultSet visitClearDataCacheRulesStatement(ClearDataCacheRulesStmt stmt, ConnectContext context) {
+            Authorizer.checkSystemOperate(context);
             ErrorReport.wrapWithRuntimeException(() -> {
                 DataCacheMgr.getInstance().clearRules();
             });

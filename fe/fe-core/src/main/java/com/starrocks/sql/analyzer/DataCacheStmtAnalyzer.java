@@ -39,6 +39,7 @@ import com.starrocks.sql.ast.DropDataCacheRuleStmt;
 import com.starrocks.sql.ast.InsertStmt;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.SelectRelation;
+import com.starrocks.sql.ast.ShowDataCacheRulesStmt;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.TableRelation;
 
@@ -113,6 +114,12 @@ public class DataCacheStmtAnalyzer {
                 ExpressionAnalyzer.analyzeExpression(predicates, new AnalyzeState(), scope, null);
             }
 
+            return null;
+        }
+
+        @Override
+        public Void visitShowDataCacheRulesStatement(ShowDataCacheRulesStmt statement, ConnectContext context) {
+            checkSystemOperate(context);
             return null;
         }
 
@@ -192,16 +199,31 @@ public class DataCacheStmtAnalyzer {
 
         private static void checkConcreteTargetVisibility(
                 ConnectContext context, String catalogName, String dbName, String tableName) {
-            if (isSelectAll(catalogName) || isSelectAll(dbName) || isSelectAll(tableName)) {
+            if (isSelectAll(catalogName)) {
                 return;
             }
             try {
-                Authorizer.checkAnyActionOnTable(
-                        context, new TableName(catalogName, dbName, tableName));
+                if (isSelectAll(dbName)) {
+                    Authorizer.checkAnyActionOnCatalog(context, catalogName);
+                } else if (isSelectAll(tableName)) {
+                    Authorizer.checkAnyActionOnOrInDb(context, catalogName, dbName);
+                } else {
+                    Authorizer.checkAnyActionOnTable(
+                            context, new TableName(catalogName, dbName, tableName));
+                }
             } catch (AccessDeniedException e) {
+                ObjectType objectType = ObjectType.TABLE;
+                String objectName = tableName;
+                if (isSelectAll(dbName)) {
+                    objectType = ObjectType.CATALOG;
+                    objectName = catalogName;
+                } else if (isSelectAll(tableName)) {
+                    objectType = ObjectType.DATABASE;
+                    objectName = dbName;
+                }
                 AccessDeniedException.reportAccessDenied(
                         catalogName, context.getCurrentUserIdentity(), context.getCurrentRoleIds(),
-                        PrivilegeType.ANY.name(), ObjectType.TABLE.name(), tableName);
+                        PrivilegeType.ANY.name(), objectType.name(), objectName);
             }
         }
     }

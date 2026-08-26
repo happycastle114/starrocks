@@ -118,8 +118,11 @@ public class DataCacheStmtAnalyzerTest {
         Optional<DataCacheRule> dataCacheRule = DataCacheMgr.getInstance().getCacheRule(stmt.getTarget());
         Assertions.assertTrue(dataCacheRule.isPresent());
         Assertions.assertEquals(
-                "[id = 0, target = hive0.datacache_db.multi_partition_table, predicates = `hive0`.`datacache_db`" +
-                        ".`multi_partition_table`.`l_shipdate` > '2012-1-1', priority = -1, properties = NULL]",
+                String.format(
+                        "[id = %d, target = hive0.datacache_db.multi_partition_table, predicates = " +
+                                "`hive0`.`datacache_db`.`multi_partition_table`.`l_shipdate` > '2012-1-1', " +
+                                "priority = -1, properties = NULL]",
+                        dataCacheRule.get().getId()),
                 dataCacheRule.get().toString());
     }
 

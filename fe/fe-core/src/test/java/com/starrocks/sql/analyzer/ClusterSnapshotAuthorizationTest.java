@@ -107,7 +107,7 @@ public class ClusterSnapshotAuthorizationTest {
     }
 
     @Test
-    public void testSharedNothingModeRejectsBeforeAuthorization() {
+    public void testSharedNothingModeIsDisclosedOnlyAfterAuthorization() {
         ConnectContext context = new ConnectContext();
         AdminSetAutomatedSnapshotOnStmt statement =
                 new AdminSetAutomatedSnapshotOnStmt(STORAGE_VOLUME, null);
@@ -121,7 +121,7 @@ public class ClusterSnapshotAuthorizationTest {
                     SemanticException.class,
                     () -> ClusterSnapshotAnalyzer.analyze(statement, context));
 
-            authorizer.verifyNoInteractions();
+            authorizer.verify(() -> Authorizer.checkSystemAction(context, PrivilegeType.OPERATE));
             globalState.verifyNoInteractions();
         }
     }

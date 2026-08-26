@@ -386,7 +386,7 @@ public class Authorizer {
         }
     }
 
-    private static void checkSystemOperate(ConnectContext context) {
+    public static void checkSystemOperate(ConnectContext context) {
         try {
             checkSystemAction(context, PrivilegeType.OPERATE);
         } catch (AccessDeniedException e) {
