@@ -19,6 +19,7 @@ import com.starrocks.authorization.ExternalAccessController;
 import com.starrocks.authorization.PrivilegeType;
 import com.starrocks.catalog.Column;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.qe.SqlModeHelper;
 import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.sql.parser.SqlParser;
 import org.apache.commons.lang.StringUtils;
@@ -92,7 +93,7 @@ public abstract class RangerAccessController extends ExternalAccessController im
                         .replace("{type}", column.getType().toSql());
             }
 
-            return SqlParser.parseSqlToExpr(transformer, context.getSessionVariable().getSqlMode());
+            return SqlParser.parseSqlToExpr(transformer, SqlModeHelper.MODE_DEFAULT);
         }
 
         return null;
@@ -104,7 +105,7 @@ public abstract class RangerAccessController extends ExternalAccessController im
                 PrivilegeType.SELECT.name().toLowerCase(ENGLISH));
         RangerAccessResult result = rangerPlugin.evalRowFilterPolicies(request, null);
         if (result != null && result.isRowFilterEnabled()) {
-            return SqlParser.parseSqlToExpr(result.getFilterExpr(), context.getSessionVariable().getSqlMode());
+            return SqlParser.parseSqlToExpr(result.getFilterExpr(), SqlModeHelper.MODE_DEFAULT);
         } else {
             return null;
         }

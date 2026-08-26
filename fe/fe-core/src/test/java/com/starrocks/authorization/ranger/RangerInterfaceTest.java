@@ -16,7 +16,9 @@ package com.starrocks.authorization.ranger;
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.ArithmeticExpr;
 import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.CompoundPredicate;
 import com.starrocks.analysis.Expr;
+import com.starrocks.analysis.FunctionCallExpr;
 import com.starrocks.analysis.NullLiteral;
 import com.starrocks.analysis.TableName;
 import com.starrocks.authorization.AccessControlProvider;
@@ -29,6 +31,7 @@ import com.starrocks.authorization.ranger.starrocks.RangerStarRocksResource;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Type;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.qe.SqlModeHelper;
 import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.ast.AstTraverser;
 import com.starrocks.sql.ast.QueryStatement;
@@ -194,6 +197,50 @@ public class RangerInterfaceTest {
 
         Expr rowFilter = rangerStarRocksAccessController.getRowAccessPolicy(connectContext, tableName);
         Assertions.assertTrue(rowFilter instanceof BinaryPredicate);
+    }
+
+    @Test
+    public void testRangerPolicyExpressionsUseDefaultSqlMode() {
+        String policyExpression = "'left' || 'right'";
+        new MockUp<RangerBasePlugin>() {
+            @Mock
+            RangerAccessResult evalDataMaskPolicies(RangerAccessRequest request,
+                                                    RangerAccessResultProcessor resultProcessor) {
+                RangerAccessResult result = new RangerAccessResult(1, "starrocks",
+                        new RangerServiceDef(), new RangerAccessRequestImpl());
+                result.setMaskType(RangerPolicy.MASK_TYPE_CUSTOM);
+                result.setMaskedValue(policyExpression);
+                return result;
+            }
+
+            @Mock
+            RangerAccessResult evalRowFilterPolicies(RangerAccessRequest request,
+                                                     RangerAccessResultProcessor resultProcessor) {
+                RangerAccessResult result = new RangerAccessResult(1, "starrocks",
+                        new RangerServiceDef(), new RangerAccessRequestImpl());
+                result.setFilterExpr(policyExpression);
+                return result;
+            }
+        };
+
+        long callerSqlMode = SqlModeHelper.MODE_DEFAULT
+                | SqlModeHelper.MODE_PIPES_AS_CONCAT
+                | SqlModeHelper.MODE_ANSI_QUOTES;
+        ConnectContext context = new ConnectContext();
+        context.setCurrentUserIdentity(UserIdentity.ROOT);
+        context.getSessionVariable().setSqlMode(callerSqlMode);
+
+        Assertions.assertTrue(SqlParser.parseSqlToExpr(policyExpression, callerSqlMode) instanceof FunctionCallExpr);
+
+        RangerStarRocksAccessController controller = new RangerStarRocksAccessController();
+        TableName tableName = new TableName("db", "tbl");
+        Map<String, Expr> maskingPolicies = controller.getColumnMaskingPolicy(
+                context, tableName, Lists.newArrayList(new Column("v1", Type.INT)));
+        Expr rowFilter = controller.getRowAccessPolicy(context, tableName);
+
+        Assertions.assertTrue(maskingPolicies.get("v1") instanceof CompoundPredicate);
+        Assertions.assertTrue(rowFilter instanceof CompoundPredicate);
+        Assertions.assertEquals(callerSqlMode, context.getSessionVariable().getSqlMode());
     }
 
     @Test
