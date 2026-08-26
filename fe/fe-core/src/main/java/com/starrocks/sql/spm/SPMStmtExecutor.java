@@ -28,6 +28,7 @@ import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.ShowResultMetaFactory;
 import com.starrocks.qe.ShowResultSet;
 import com.starrocks.sql.analyzer.Analyzer;
+import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.analyzer.PlannerMetaLocker;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.spm.ControlBaselinePlanStmt;
@@ -37,10 +38,15 @@ import com.starrocks.sql.ast.spm.ShowBaselinePlanStmt;
 
 import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 public class SPMStmtExecutor {
     public static BaselinePlan execute(ConnectContext context, CreateBaselinePlanStmt stmt) {
+        if (stmt.isGlobal()) {
+            Authorizer.checkSystemOperate(context);
+        }
         SPMPlanBuilder builder = new SPMPlanBuilder(context, stmt);
         BaselinePlan plan = builder.execute();
         plan.setEnable(true);
@@ -55,17 +61,24 @@ public class SPMStmtExecutor {
     }
 
     public static void execute(ConnectContext context, DropBaselinePlanStmt stmt) {
+        boolean mutateGlobal = authorizeGlobalMutation(context, stmt.getBaseLineId());
         context.getSqlPlanStorage().dropBaselinePlan(stmt.getBaseLineId());
-        context.getGlobalStateMgr().getSqlPlanStorage().dropBaselinePlan(stmt.getBaseLineId());
+        if (mutateGlobal) {
+            context.getGlobalStateMgr().getSqlPlanStorage().dropBaselinePlan(stmt.getBaseLineId());
+        }
     }
 
     public static ShowResultSet execute(ConnectContext context, ShowBaselinePlanStmt stmt) {
         Expr where = null;
         if (stmt.getQuery() != null) {
             QueryStatement p = new QueryStatement(stmt.getQuery());
+            Authorizer.checkRangerManagedQueryBeforeAnalysis(p, context);
             try (PlannerMetaLocker locker = new PlannerMetaLocker(context, p)) {
                 locker.lock();
                 Analyzer.analyze(p, context);
+                if (!context.isBypassAuthorizerCheck()) {
+                    Authorizer.check(p, context);
+                }
             }
             SPMAst2SQLBuilder builder = new SPMAst2SQLBuilder(false, true);
             String digest = builder.build(p);
@@ -82,7 +95,9 @@ public class SPMStmtExecutor {
         }
 
         List<BaselinePlan> baselines1 = context.getSqlPlanStorage().getBaselines(where);
-        List<BaselinePlan> baselines2 = context.getGlobalStateMgr().getSqlPlanStorage().getBaselines(where);
+        List<BaselinePlan> baselines2 = Authorizer.hasSystemOperate(context)
+                ? context.getGlobalStateMgr().getSqlPlanStorage().getBaselines(where)
+                : List.of();
         List<List<String>> rows = Lists.newArrayList();
 
         Stream.concat(baselines1.stream(), baselines2.stream()).forEach(baseline -> {
@@ -105,7 +120,24 @@ public class SPMStmtExecutor {
     }
 
     public static void execute(ConnectContext context, ControlBaselinePlanStmt stmt) {
-        context.getGlobalStateMgr().getSqlPlanStorage().controlBaselinePlan(stmt.isEnable(), stmt.getBaseLineId());
+        boolean mutateGlobal = authorizeGlobalMutation(context, stmt.getBaseLineId());
         context.getSqlPlanStorage().controlBaselinePlan(stmt.isEnable(), stmt.getBaseLineId());
+        if (mutateGlobal) {
+            context.getGlobalStateMgr().getSqlPlanStorage().controlBaselinePlan(stmt.isEnable(), stmt.getBaseLineId());
+        }
+    }
+
+    private static boolean authorizeGlobalMutation(ConnectContext context, List<Long> baselineIds) {
+        Set<Long> sessionIds = context.getSqlPlanStorage().getBaselines(null).stream()
+                .map(BaselinePlan::getId)
+                .collect(Collectors.toSet());
+        if (Authorizer.hasSystemOperate(context)) {
+            return true;
+        }
+        if (sessionIds.containsAll(baselineIds)) {
+            return false;
+        }
+        Authorizer.checkSystemOperate(context);
+        return true;
     }
 }

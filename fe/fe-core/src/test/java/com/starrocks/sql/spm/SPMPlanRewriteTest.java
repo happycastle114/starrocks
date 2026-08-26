@@ -16,6 +16,7 @@ package com.starrocks.sql.spm;
 
 import com.google.common.base.Preconditions;
 import com.starrocks.sql.analyzer.AstToSQLBuilder;
+import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.spm.CreateBaselinePlanStmt;
 import com.starrocks.sql.parser.SqlParser;
@@ -24,6 +25,8 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 
 import java.util.List;
 
@@ -61,6 +64,28 @@ public class SPMPlanRewriteTest extends PlanTestBase {
         StatementBase query = planner.plan(statements.get(0));
         Assertions.assertTrue(planner.getBaseline().getId() > 1);
         Assertions.assertNotEquals(query, statements.get(0));
+    }
+
+    @Test
+    public void testManagedReplacementCannotIntroduceForbiddenQuery() {
+        BaselinePlan safe = SPMStmtExecutor.execute(
+                connectContext, createBaselinePlanStmt("select * from t0 where v2 = 1"));
+        BaselinePlan forbidden = new BaselinePlan(
+                safe.getBindSql(), safe.getBindSqlDigest(), safe.getBindSqlHash(),
+                "SELECT * FROM FILES(\"path\" = \"s3://bucket/file.parquet\")", safe.getCosts());
+        forbidden.setEnable(true);
+        connectContext.getSqlPlanStorage().dropAllBaselinePlans();
+        connectContext.getSqlPlanStorage().storeBaselinePlan(List.of(forbidden));
+
+        StatementBase original = SqlParser.parse(
+                "select * from t0 where v2 = 20", connectContext.getSessionVariable()).get(0);
+        SPMPlanner planner = new SPMPlanner(connectContext);
+        try (MockedStatic<Authorizer> authorizer =
+                    Mockito.mockStatic(Authorizer.class, Mockito.CALLS_REAL_METHODS)) {
+            authorizer.when(() -> Authorizer.isRangerManagedContext(connectContext)).thenReturn(true);
+            Assertions.assertSame(original, planner.plan(original));
+        }
+        Assertions.assertNull(planner.getBaseline());
     }
 
     @Test

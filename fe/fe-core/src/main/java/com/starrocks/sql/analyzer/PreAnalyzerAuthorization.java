@@ -24,6 +24,8 @@ import com.starrocks.server.CatalogMgr;
 import com.starrocks.sql.ast.AlterViewStmt;
 import com.starrocks.sql.ast.AstTraverser;
 import com.starrocks.sql.ast.CTERelation;
+import com.starrocks.sql.ast.CancelRefreshDictionaryStmt;
+import com.starrocks.sql.ast.CreateDictionaryStmt;
 import com.starrocks.sql.ast.CreateFunctionStmt;
 import com.starrocks.sql.ast.CreateMaterializedViewStatement;
 import com.starrocks.sql.ast.CreateMaterializedViewStmt;
@@ -33,9 +35,11 @@ import com.starrocks.sql.ast.CreateTemporaryTableStmt;
 import com.starrocks.sql.ast.CreateViewStmt;
 import com.starrocks.sql.ast.DeleteStmt;
 import com.starrocks.sql.ast.DmlStmt;
+import com.starrocks.sql.ast.DropDictionaryStmt;
 import com.starrocks.sql.ast.FileTableFunctionRelation;
 import com.starrocks.sql.ast.InsertStmt;
 import com.starrocks.sql.ast.QueryStatement;
+import com.starrocks.sql.ast.RefreshDictionaryStmt;
 import com.starrocks.sql.ast.SelectRelation;
 import com.starrocks.sql.ast.SetOperationRelation;
 import com.starrocks.sql.ast.StatementBase;
@@ -138,12 +142,22 @@ public final class PreAnalyzerAuthorization {
             StatementBase statement, ConnectContext session) {
         if (!(statement instanceof CreateTemporaryTableStmt)
                 && !(statement instanceof CreateTemporaryTableLikeStmt)
+                && !(statement instanceof CreateDictionaryStmt)
+                && !(statement instanceof DropDictionaryStmt)
+                && !(statement instanceof RefreshDictionaryStmt)
+                && !(statement instanceof CancelRefreshDictionaryStmt)
                 && !(statement instanceof PlanAdvisorStmt)) {
             return false;
         }
 
         Authorizer.getInstance().validateAccessControlContext(session);
-        if (statement instanceof CreateTemporaryTableLikeStmt createLike) {
+        if (statement instanceof CreateDictionaryStmt createDictionary) {
+            Authorizer.checkDictionaryCreateBeforeAnalyze(createDictionary, session);
+        } else if (statement instanceof DropDictionaryStmt
+                || statement instanceof RefreshDictionaryStmt
+                || statement instanceof CancelRefreshDictionaryStmt) {
+            Authorizer.checkSystemOperate(session);
+        } else if (statement instanceof CreateTemporaryTableLikeStmt createLike) {
             checkCreateTemporaryTableTarget(createLike.getDbTbl(), session);
             checkCreateTemporaryTableSource(createLike.getExistedDbTbl(), session);
         } else if (statement instanceof CreateTemporaryTableStmt createTemporaryTable) {

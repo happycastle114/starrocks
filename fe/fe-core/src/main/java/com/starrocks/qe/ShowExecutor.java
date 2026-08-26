@@ -3001,6 +3001,7 @@ public class ShowExecutor {
 
         @Override
         public ShowResultSet visitShowFailPointStatement(ShowFailPointStatement statement, ConnectContext context) {
+            Authorizer.checkSystemOperate(context);
             // send request and build resultSet
             PListFailPointRequest request = new PListFailPointRequest();
             SystemInfoService clusterInfoService = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();

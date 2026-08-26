@@ -21,6 +21,7 @@ import com.starrocks.common.DdlException;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.SessionVariable;
 import com.starrocks.sql.analyzer.Analyzer;
+import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.analyzer.PlannerMetaLocker;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.QueryRelation;
@@ -160,11 +161,22 @@ public class SPMPlanBuilder {
 
     protected void analyze() {
         QueryStatement p = new QueryStatement(this.planStmt);
-        try (PlannerMetaLocker locker = new PlannerMetaLocker(session, p)) {
+        p.setAllQueryScopeHints(planHints);
+        analyzeAndAuthorize(p);
+        if (this.bindStmt != null) {
+            QueryStatement bindQuery = new QueryStatement(this.bindStmt);
+            bindQuery.setAllQueryScopeHints(planHints);
+            analyzeAndAuthorize(bindQuery);
+        }
+    }
+
+    private void analyzeAndAuthorize(QueryStatement query) {
+        Authorizer.checkRangerManagedQueryBeforeAnalysis(query, session);
+        try (PlannerMetaLocker locker = new PlannerMetaLocker(session, query)) {
             locker.lock();
-            Analyzer.analyze(p, session);
-            if (this.bindStmt != null) {
-                Analyzer.analyze(new QueryStatement(this.bindStmt), session);
+            Analyzer.analyze(query, session);
+            if (!session.isBypassAuthorizerCheck()) {
+                Authorizer.check(query, session);
             }
         }
     }

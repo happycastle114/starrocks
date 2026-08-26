@@ -35,6 +35,7 @@ import com.starrocks.catalog.Database;
 import com.starrocks.catalog.Function;
 import com.starrocks.catalog.FunctionSearchDesc;
 import com.starrocks.catalog.InternalCatalog;
+import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Resource;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.DdlException;
@@ -50,6 +51,7 @@ import com.starrocks.load.loadv2.SparkLoadJob;
 import com.starrocks.load.routineload.RoutineLoadJob;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.SessionVariable;
+import com.starrocks.scheduler.Task;
 import com.starrocks.server.CatalogMgr;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.server.WarehouseManager;
@@ -60,6 +62,7 @@ import com.starrocks.sql.ast.AdminCancelRepairTableStmt;
 import com.starrocks.sql.ast.AdminCheckTabletsStmt;
 import com.starrocks.sql.ast.AdminRepairTableStmt;
 import com.starrocks.sql.ast.AdminSetConfigStmt;
+import com.starrocks.sql.ast.AdminSetPartitionVersionStmt;
 import com.starrocks.sql.ast.AdminSetReplicaStatusStmt;
 import com.starrocks.sql.ast.AdminShowAutomatedSnapshotStmt;
 import com.starrocks.sql.ast.AdminShowConfigStmt;
@@ -93,12 +96,14 @@ import com.starrocks.sql.ast.CancelBackupStmt;
 import com.starrocks.sql.ast.CancelCompactionStmt;
 import com.starrocks.sql.ast.CancelExportStmt;
 import com.starrocks.sql.ast.CancelLoadStmt;
+import com.starrocks.sql.ast.CancelRefreshDictionaryStmt;
 import com.starrocks.sql.ast.CancelRefreshMaterializedViewStmt;
 import com.starrocks.sql.ast.CatalogRef;
 import com.starrocks.sql.ast.CleanTemporaryTableStmt;
 import com.starrocks.sql.ast.CreateAnalyzeJobStmt;
 import com.starrocks.sql.ast.CreateCatalogStmt;
 import com.starrocks.sql.ast.CreateDbStmt;
+import com.starrocks.sql.ast.CreateDictionaryStmt;
 import com.starrocks.sql.ast.CreateFileStmt;
 import com.starrocks.sql.ast.CreateFunctionStmt;
 import com.starrocks.sql.ast.CreateMaterializedViewStatement;
@@ -124,6 +129,7 @@ import com.starrocks.sql.ast.DescStorageVolumeStmt;
 import com.starrocks.sql.ast.DescribeStmt;
 import com.starrocks.sql.ast.DropCatalogStmt;
 import com.starrocks.sql.ast.DropDbStmt;
+import com.starrocks.sql.ast.DropDictionaryStmt;
 import com.starrocks.sql.ast.DropFileStmt;
 import com.starrocks.sql.ast.DropFunctionStmt;
 import com.starrocks.sql.ast.DropHistogramStmt;
@@ -135,6 +141,7 @@ import com.starrocks.sql.ast.DropRoleStmt;
 import com.starrocks.sql.ast.DropStatsStmt;
 import com.starrocks.sql.ast.DropStorageVolumeStmt;
 import com.starrocks.sql.ast.DropTableStmt;
+import com.starrocks.sql.ast.DropTaskStmt;
 import com.starrocks.sql.ast.DropUserStmt;
 import com.starrocks.sql.ast.ExecuteAsStmt;
 import com.starrocks.sql.ast.ExecuteScriptStmt;
@@ -151,6 +158,7 @@ import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.RecoverDbStmt;
 import com.starrocks.sql.ast.RecoverPartitionStmt;
 import com.starrocks.sql.ast.RecoverTableStmt;
+import com.starrocks.sql.ast.RefreshDictionaryStmt;
 import com.starrocks.sql.ast.RefreshMaterializedViewStatement;
 import com.starrocks.sql.ast.RefreshTableStmt;
 import com.starrocks.sql.ast.RestoreStmt;
@@ -183,6 +191,7 @@ import com.starrocks.sql.ast.ShowCreateTableStmt;
 import com.starrocks.sql.ast.ShowDataDistributionStmt;
 import com.starrocks.sql.ast.ShowDataStmt;
 import com.starrocks.sql.ast.ShowExportStmt;
+import com.starrocks.sql.ast.ShowFailPointStatement;
 import com.starrocks.sql.ast.ShowFrontendsStmt;
 import com.starrocks.sql.ast.ShowFunctionsStmt;
 import com.starrocks.sql.ast.ShowGrantsStmt;
@@ -215,6 +224,7 @@ import com.starrocks.sql.ast.SubmitTaskStmt;
 import com.starrocks.sql.ast.SystemVariable;
 import com.starrocks.sql.ast.TruncateTableStmt;
 import com.starrocks.sql.ast.UninstallPluginStmt;
+import com.starrocks.sql.ast.UpdateFailPointStatusStatement;
 import com.starrocks.sql.ast.UpdateStmt;
 import com.starrocks.sql.ast.UseCatalogStmt;
 import com.starrocks.sql.ast.UseDbStmt;
@@ -238,6 +248,7 @@ import com.starrocks.sql.ast.pipe.DescPipeStmt;
 import com.starrocks.sql.ast.pipe.DropPipeStmt;
 import com.starrocks.sql.ast.pipe.PipeName;
 import com.starrocks.sql.ast.pipe.ShowPipeStmt;
+import com.starrocks.sql.ast.spm.CreateBaselinePlanStmt;
 import com.starrocks.sql.ast.warehouse.AlterWarehouseStmt;
 import com.starrocks.sql.ast.warehouse.CreateWarehouseStmt;
 import com.starrocks.sql.ast.warehouse.DropWarehouseStmt;
@@ -1892,7 +1903,19 @@ public class AuthorizerStmtVisitor implements AstVisitor<Void, ConnectContext> {
                 Table table = GlobalStateMgr.getCurrentState().getLocalMetastore()
                         .getTable(db.getFullName(), statement.getTableName());
                 if (table == null || !table.isMaterializedView()) {
-                    // ignore privilege check for old mv
+                    try {
+                        OlapTable baseTable = GlobalStateMgr.getCurrentState()
+                                .getRollupHandler()
+                                .findLegacyMaterializedViewBaseTable(
+                                        statement.getDbName(), statement.getTableName());
+                        if (baseTable != null) {
+                            Authorizer.checkTableAlter(context,
+                                    new TableName(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME,
+                                            statement.getDbName(), baseTable.getName()));
+                        }
+                    } catch (DdlException e) {
+                        throw new SemanticException(e.getMessage());
+                    }
                     return null;
                 }
             }
@@ -2040,6 +2063,48 @@ public class AuthorizerStmtVisitor implements AstVisitor<Void, ConnectContext> {
     }
 
     @Override
+    public Void visitDropTaskStmt(DropTaskStmt statement, ConnectContext context) {
+        String taskName = statement.getTaskName().getName();
+        Task task = context.getGlobalStateMgr().getTaskManager().getTask(taskName);
+        if (task != null) {
+            Authorizer.checkDropTask(context, task, statement.isForce());
+        }
+        return null;
+    }
+
+    @Override
+    public Void visitCreateDictionaryStatement(CreateDictionaryStmt statement, ConnectContext context) {
+        Authorizer.checkDictionaryCreateBeforeAnalyze(statement, context);
+        return null;
+    }
+
+    @Override
+    public Void visitDropDictionaryStatement(DropDictionaryStmt statement, ConnectContext context) {
+        Authorizer.checkSystemOperate(context);
+        return null;
+    }
+
+    @Override
+    public Void visitRefreshDictionaryStatement(RefreshDictionaryStmt statement, ConnectContext context) {
+        Authorizer.checkSystemOperate(context);
+        return null;
+    }
+
+    @Override
+    public Void visitCancelRefreshDictionaryStatement(CancelRefreshDictionaryStmt statement, ConnectContext context) {
+        Authorizer.checkSystemOperate(context);
+        return null;
+    }
+
+    @Override
+    public Void visitCreateBaselinePlanStatement(CreateBaselinePlanStmt statement, ConnectContext context) {
+        if (statement.isGlobal()) {
+            Authorizer.checkSystemOperate(context);
+        }
+        return null;
+    }
+
+    @Override
     public Void visitDataCacheSelectStatement(DataCacheSelectStatement statement, ConnectContext context) {
         // check we have permission access source data
         visitQueryStatement(statement.getInsertStmt().getQueryStatement(), context);
@@ -2081,6 +2146,25 @@ public class AuthorizerStmtVisitor implements AstVisitor<Void, ConnectContext> {
                     context.getCurrentUserIdentity(), context.getCurrentRoleIds(),
                     PrivilegeType.OPERATE.name(), ObjectType.SYSTEM.name(), null);
         }
+        return null;
+    }
+
+    @Override
+    public Void visitAdminSetPartitionVersionStmt(AdminSetPartitionVersionStmt statement, ConnectContext context) {
+        Authorizer.checkSystemOperate(context);
+        return null;
+    }
+
+    @Override
+    public Void visitUpdateFailPointStatusStatement(UpdateFailPointStatusStatement statement,
+                                                    ConnectContext context) {
+        Authorizer.checkSystemOperate(context);
+        return null;
+    }
+
+    @Override
+    public Void visitShowFailPointStatement(ShowFailPointStatement statement, ConnectContext context) {
+        Authorizer.checkSystemOperate(context);
         return null;
     }
 

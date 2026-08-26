@@ -305,5 +305,8 @@ public class Task implements Writable, GsonPostProcessable {
         if (consecutiveFailCount == null) {
             this.consecutiveFailCount = new AtomicInteger();
         }
+        if (userIdentity == null && createUser != null) {
+            userIdentity = UserIdentity.createAnalyzedUserIdentWithIp(createUser, "%");
+        }
     }
 }

@@ -3604,6 +3604,14 @@ public class LocalMetastore implements ConnectorMetadata, MVRepairHandler, Memor
         cancelAlter(stmt, "user cancelled");
     }
 
+    public void cancelAlter(CancelAlterTableStmt stmt, ConnectContext context) throws DdlException {
+        if (stmt.getAlterType() == ShowAlterStmt.AlterType.MATERIALIZED_VIEW) {
+            stateMgr.getRollupHandler().cancelMV(stmt, context);
+            return;
+        }
+        cancelAlter(stmt);
+    }
+
     // entry of rename table operation
     @Override
     public void renameTable(Database db, Table table, TableRenameClause tableRenameClause) throws DdlException {

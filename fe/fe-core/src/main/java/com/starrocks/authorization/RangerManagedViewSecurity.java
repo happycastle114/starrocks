@@ -130,7 +130,9 @@ public final class RangerManagedViewSecurity {
     }
 
     private static boolean shouldCheck(ConnectContext context) {
-        return context != null && !context.isBypassAuthorizerCheck() && Authorizer.isRangerManagedContext(context);
+        return context != null
+                && !context.isBypassAuthorizerCheck()
+                && Authorizer.isRangerManagedContext(context);
     }
 
     static boolean isForbiddenTableHint(String hint) {

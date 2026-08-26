@@ -30,6 +30,7 @@ import com.starrocks.common.profile.Tracers;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.analyzer.Analyzer;
+import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.analyzer.PlannerMetaLocker;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.StatementBase;
@@ -124,9 +125,15 @@ public class SPMPlanner {
     }
 
     private void analyze(StatementBase query) {
+        if (query instanceof QueryStatement queryStatement) {
+            Authorizer.checkRangerManagedQueryBeforeAnalysis(queryStatement, session);
+        }
         try (PlannerMetaLocker locker = new PlannerMetaLocker(session, query)) {
             locker.lock();
             Analyzer.analyze(query, session);
+            if (!session.isBypassAuthorizerCheck()) {
+                Authorizer.check(query, session);
+            }
         }
     }
 
@@ -141,10 +148,14 @@ public class SPMPlanner {
     private StatementBase replacePlan(BaselinePlan baseline) {
         List<StatementBase> plan = SqlParser.parse(baseline.getPlanSql(), session.getSessionVariable());
         Preconditions.checkState(plan.size() == 1);
-        if (placeholderValues.isEmpty()) {
-            return plan.get(0);
+        StatementBase replacement = plan.get(0);
+        if (!placeholderValues.isEmpty()) {
+            replacement = (StatementBase) replacer.visit(replacement);
         }
-        return (StatementBase) replacer.visit(plan.get(0));
+        if (replacement instanceof QueryStatement queryStatement) {
+            Authorizer.checkRangerManagedQueryBeforeAnalysis(queryStatement, session);
+        }
+        return replacement;
     }
 
     private class PlaceholderBinder extends SPMAstCheckVisitor {

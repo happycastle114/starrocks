@@ -34,9 +34,12 @@ import com.starrocks.catalog.Table;
 import com.starrocks.common.MetaNotFoundException;
 import com.starrocks.common.Pair;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.scheduler.Constants;
+import com.starrocks.scheduler.Task;
 import com.starrocks.server.CatalogMgr;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.server.WarehouseManager;
+import com.starrocks.sql.ast.CreateDictionaryStmt;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.UserIdentity;
@@ -93,6 +96,56 @@ public class Authorizer {
     public static void checkRangerManagedStoredDefinitionBeforeAnalysis(
             QueryStatement statement, ConnectContext context) {
         RangerManagedViewSecurity.checkStoredDefinitionBeforeAnalysis(context, statement);
+    }
+
+    public static void checkDictionaryCreateBeforeAnalyze(
+            CreateDictionaryStmt statement, ConnectContext context) {
+        if (context.isBypassAuthorizerCheck()) {
+            return;
+        }
+        checkSystemOperate(context);
+
+        TableName source = statement.getQueryableObjectName();
+        source.normalization(context);
+        checkSelectOnUnresolvedTableLikeObject(context, source);
+    }
+
+    public static void checkDropTask(ConnectContext context, Task task, boolean force) {
+        if (context.isBypassAuthorizerCheck()) {
+            return;
+        }
+        getInstance().validateAccessControlContext(context);
+        UserIdentity creator = task.getUserIdentity();
+        boolean ownerMayDrop = !force
+                && task.getSource() != Constants.TaskSource.MV
+                && task.getSource() != Constants.TaskSource.PIPE;
+        if (ownerMayDrop && creator != null && creator.equals(context.getCurrentUserIdentity())) {
+            return;
+        }
+        try {
+            checkSystemAction(context, PrivilegeType.OPERATE);
+        } catch (AccessDeniedException e) {
+            String ownershipAlternative = ownerMayDrop ? "(or be the task creator)" : null;
+            AccessDeniedException.reportAccessDenied(
+                    InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME,
+                    context.getCurrentUserIdentity(), context.getCurrentRoleIds(),
+                    PrivilegeType.OPERATE.name(), ObjectType.SYSTEM.name(),
+                    ownershipAlternative);
+        }
+    }
+
+    public static void checkTableAlter(ConnectContext context, TableName tableName) {
+        if (context.isBypassAuthorizerCheck()) {
+            return;
+        }
+        getInstance().validateAccessControlContext(context);
+        try {
+            checkTableAction(context, tableName, PrivilegeType.ALTER);
+        } catch (AccessDeniedException e) {
+            AccessDeniedException.reportAccessDenied(
+                    tableName.getCatalog(), context.getCurrentUserIdentity(), context.getCurrentRoleIds(),
+                    PrivilegeType.ALTER.name(), ObjectType.TABLE.name(), tableName.getTbl());
+        }
     }
 
     public static void checkSystemAction(ConnectContext context, PrivilegeType privilegeType)

@@ -39,9 +39,11 @@ import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.starrocks.analysis.Expr;
+import com.starrocks.analysis.TableName;
 import com.starrocks.catalog.AggregateType;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
+import com.starrocks.catalog.InternalCatalog;
 import com.starrocks.catalog.KeysType;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.MaterializedIndex.IndexState;
@@ -74,6 +76,7 @@ import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.server.RunMode;
 import com.starrocks.server.WarehouseManager;
 import com.starrocks.sql.analyzer.AstToSQLBuilder;
+import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.ast.AddRollupClause;
 import com.starrocks.sql.ast.AlterClause;
 import com.starrocks.sql.ast.CancelAlterTableStmt;
@@ -1076,54 +1079,97 @@ public class MaterializedViewHandler extends AlterHandler {
     }
 
     public void cancelMV(CancelStmt stmt) throws DdlException {
-        CancelAlterTableStmt cancelAlterTableStmt = (CancelAlterTableStmt) stmt;
+        cancelLegacyMaterializedView((CancelAlterTableStmt) stmt, null);
+    }
 
-        String dbName = cancelAlterTableStmt.getDbName();
-        String tableName = cancelAlterTableStmt.getTableName();
+    public void cancelMV(CancelStmt stmt, ConnectContext context) throws DdlException {
+        cancelLegacyMaterializedView((CancelAlterTableStmt) stmt, context);
+    }
+
+    public OlapTable findLegacyMaterializedViewBaseTable(String dbName, String mvName) throws DdlException {
+        LegacyMaterializedViewJob resolved = resolveLegacyMaterializedViewJob(dbName, mvName);
+        return resolved == null ? null : resolved.baseTable;
+    }
+
+    private void cancelLegacyMaterializedView(CancelAlterTableStmt statement, ConnectContext context)
+            throws DdlException {
+        LegacyMaterializedViewJob resolved = resolveLegacyMaterializedViewJob(
+                statement.getDbName(), statement.getTableName());
+        if (resolved == null) {
+            throw new DdlException("Table[" + statement.getTableName() + "] is not under MATERIALIZED VIEW. "
+                    + "Use 'DROP MATERIALIZED VIEW' if you want to.");
+        }
+        if (context != null) {
+            Authorizer.checkTableAlter(context,
+                    new TableName(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME,
+                            statement.getDbName(), resolved.baseTable.getName()));
+            resolved = resolveLegacyMaterializedViewJob(
+                    statement.getDbName(), statement.getTableName(), resolved);
+        }
+        resolved.job.cancel("user cancelled");
+        if (resolved.job.isDone()) {
+            onJobDone(resolved.job);
+        }
+    }
+
+    private LegacyMaterializedViewJob resolveLegacyMaterializedViewJob(String dbName, String mvName)
+            throws DdlException {
+        return resolveLegacyMaterializedViewJob(dbName, mvName, null);
+    }
+
+    private LegacyMaterializedViewJob resolveLegacyMaterializedViewJob(
+            String dbName, String mvName, LegacyMaterializedViewJob expected) throws DdlException {
         Preconditions.checkState(!Strings.isNullOrEmpty(dbName));
-        Preconditions.checkState(!Strings.isNullOrEmpty(tableName));
-
+        Preconditions.checkState(!Strings.isNullOrEmpty(mvName));
         Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbName);
         if (db == null) {
             ErrorReport.reportDdlException(ErrorCode.ERR_BAD_DB_ERROR, dbName);
         }
-        if (tableName.isEmpty()) {
-            throw new DdlException("table name should include in cancel materialized view from db-name.mv-name");
-        }
 
-        AlterJobV2 materializedViewJob = null;
+        LegacyMaterializedViewJob resolved = null;
         Locker locker = new Locker();
-        locker.lockDatabase(db.getId(), LockType.WRITE);
+        locker.lockDatabase(db.getId(), LockType.READ);
         try {
             for (Table table : GlobalStateMgr.getCurrentState().getLocalMetastore().getTables(db.getId())) {
-                if (table instanceof OlapTable) {
-                    List<AlterJobV2> rollupJobV2List = getUnfinishedAlterJobV2ByTableId(table.getId());
-                    for (AlterJobV2 alterJobV2 : rollupJobV2List) {
-                        if (alterJobV2 instanceof RollupJobV2) {
-                            if (((RollupJobV2) alterJobV2).getRollupIndexName().equals(tableName)) {
-                                materializedViewJob = alterJobV2;
-                            }
-                        } else if (alterJobV2 instanceof LakeRollupJob) {
-                            if (((LakeRollupJob) alterJobV2).getRollupIndexName().equals(tableName)) {
-                                materializedViewJob = alterJobV2;
-                            }
-                        }
+                if (!(table instanceof OlapTable olapTable)) {
+                    continue;
+                }
+                for (AlterJobV2 job : getUnfinishedAlterJobV2ByTableId(table.getId())) {
+                    if (isLegacyMaterializedViewJob(job, mvName)) {
+                        resolved = new LegacyMaterializedViewJob(olapTable, job);
                     }
                 }
             }
+            if (expected != null && !expected.hasSameIdentity(resolved)) {
+                throw new DdlException("Materialized view alter job changed during authorization; retry cancellation");
+            }
         } finally {
-            locker.unLockDatabase(db.getId(), LockType.WRITE);
+            locker.unLockDatabase(db.getId(), LockType.READ);
+        }
+        return resolved;
+    }
+
+    private static boolean isLegacyMaterializedViewJob(AlterJobV2 job, String mvName) {
+        if (job instanceof RollupJobV2 rollupJob) {
+            return rollupJob.getRollupIndexName().equals(mvName);
+        }
+        if (job instanceof LakeRollupJob lakeRollupJob) {
+            return lakeRollupJob.getRollupIndexName().equals(mvName);
+        }
+        return false;
+    }
+
+    private static final class LegacyMaterializedViewJob {
+        private final OlapTable baseTable;
+        private final AlterJobV2 job;
+
+        private LegacyMaterializedViewJob(OlapTable baseTable, AlterJobV2 job) {
+            this.baseTable = baseTable;
+            this.job = job;
         }
 
-        if (materializedViewJob == null) {
-            throw new DdlException("Table[" + tableName + "] is not under MATERIALIZED VIEW. "
-                    + "Use 'DROP MATERIALIZED VIEW' if you want to.");
-        } else {
-            // alter job v2's cancel must be called outside the database lock
-            materializedViewJob.cancel("user cancelled");
-            if (materializedViewJob.isDone()) {
-                onJobDone(materializedViewJob);
-            }
+        private boolean hasSameIdentity(LegacyMaterializedViewJob other) {
+            return other != null && baseTable == other.baseTable && job == other.job;
         }
     }
 

@@ -14,6 +14,7 @@
 
 package com.starrocks.sql.analyzer;
 
+import com.starrocks.analysis.TableName;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Type;
@@ -42,21 +43,23 @@ public class DictionaryAnalyzer {
                 throw new SemanticException("dictionary: " + dictionaryName + " is exist");
             }
 
-            String catalogName = context.getCurrentCatalog();
+            TableName queryableObject = statement.getQueryableObjectName();
+            queryableObject.normalization(context);
+            String catalogName = queryableObject.getCatalog();
             if (!GlobalStateMgr.getCurrentState().getCatalogMgr().catalogExists(catalogName)) {
                 throw new SemanticException("invalid catalog");
             }
 
-            String queryableObject = statement.getQueryableObject();
-            Database db = GlobalStateMgr.getCurrentState().getMetadataMgr().getDb(context, catalogName, context.getDatabase());
+            Database db = GlobalStateMgr.getCurrentState().getMetadataMgr()
+                    .getDb(context, catalogName, queryableObject.getDb());
             if (db == null) {
                 throw new SemanticException("USE a Database before CREATE DICTIONARY");
             }
             
             Table tbl = GlobalStateMgr.getCurrentState().getMetadataMgr().
-                                getTable(context, catalogName, context.getDatabase(), queryableObject);
+                                getTable(context, catalogName, queryableObject.getDb(), queryableObject.getTbl());
             if (tbl == null) {
-                throw new SemanticException(queryableObject + " does not exist");
+                throw new SemanticException(queryableObject.getTbl() + " does not exist");
             }
 
             // naive implementation with one key and one value

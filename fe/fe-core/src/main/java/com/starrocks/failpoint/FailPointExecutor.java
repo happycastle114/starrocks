@@ -19,11 +19,13 @@ import com.starrocks.common.DdlException;
 import com.starrocks.common.Pair;
 import com.starrocks.proto.PUpdateFailPointStatusRequest;
 import com.starrocks.proto.PUpdateFailPointStatusResponse;
+import com.starrocks.qe.ConnectContext;
 import com.starrocks.rpc.BackendServiceClient;
 import com.starrocks.rpc.RpcException;
 import com.starrocks.rpc.ThriftConnectionPool;
 import com.starrocks.rpc.ThriftRPCRequestExecutor;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.UpdateFailPointStatusStatement;
@@ -48,14 +50,17 @@ public class FailPointExecutor {
 
     private StatementBase stmt;
     private SystemInfoService clusterInfoService;
+    private final ConnectContext context;
 
-    public FailPointExecutor(StatementBase stmt) {
+    public FailPointExecutor(StatementBase stmt, ConnectContext context) {
         this.stmt = stmt;
-        clusterInfoService = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
+        this.context = context;
     }
 
     public void execute() throws Exception {
         if (stmt instanceof UpdateFailPointStatusStatement) {
+            Authorizer.checkSystemOperate(context);
+            clusterInfoService = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
             handleUpdateFailPointStatus();
         }
     }

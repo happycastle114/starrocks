@@ -2532,7 +2532,7 @@ public class StmtExecutor {
     }
 
     private void handleUpdateFailPointStatusStmt() throws Exception {
-        FailPointExecutor executor = new FailPointExecutor(parsedStmt);
+        FailPointExecutor executor = new FailPointExecutor(parsedStmt, context);
         executor.execute();
     }
 
