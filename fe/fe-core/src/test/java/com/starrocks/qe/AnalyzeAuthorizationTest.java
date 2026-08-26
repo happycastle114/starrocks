@@ -15,7 +15,6 @@
 package com.starrocks.qe;
 
 import com.starrocks.analysis.TableName;
-import com.starrocks.authorization.AccessDeniedException;
 import com.starrocks.authorization.PrivilegeType;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.jmockit.Deencapsulation;
@@ -34,6 +33,7 @@ import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -46,7 +46,8 @@ public class AnalyzeAuthorizationTest {
         StmtExecutor executor = new StmtExecutor(context, new KillAnalyzeStmt(-1));
 
         try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class);
-                MockedStatic<GlobalStateMgr> globalStateMgr = Mockito.mockStatic(GlobalStateMgr.class)) {
+                MockedStatic<GlobalStateMgr> globalStateMgr =
+                        Mockito.mockStatic(GlobalStateMgr.class)) {
             authorizer.when(() -> Authorizer.checkPrivilegeForKillAnalyzeStatement(context, -1))
                     .thenThrow(new SecurityException("denied"));
 
@@ -82,15 +83,19 @@ public class AnalyzeAuthorizationTest {
         Mockito.when(state.getAnalyzeMgr()).thenReturn(analyzeMgr);
 
         try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class);
-                MockedStatic<GlobalStateMgr> globalStateMgr = Mockito.mockStatic(GlobalStateMgr.class)) {
+                MockedStatic<GlobalStateMgr> globalStateMgr =
+                        Mockito.mockStatic(GlobalStateMgr.class)) {
             globalStateMgr.when(GlobalStateMgr::getCurrentState).thenReturn(state);
 
-            Deencapsulation.invoke(new StmtExecutor(context, new KillAnalyzeStmt(-1)), "handleKillAnalyzeStmt");
+            Deencapsulation.invoke(
+                    new StmtExecutor(context, new KillAnalyzeStmt(-1)),
+                    "handleKillAnalyzeStmt");
             new DDLStmtExecutor.StmtExecutorVisitor()
                     .visitDropAnalyzeStatement(new DropAnalyzeJobStmt(7), context);
 
             authorizer.verify(() -> Authorizer.checkPrivilegeForKillAnalyzeStatement(context, -1));
-            authorizer.verify(() -> Authorizer.checkPrivilegeForDropAnalyzeJobStatement(context, 7));
+            authorizer.verify(
+                    () -> Authorizer.checkPrivilegeForDropAnalyzeJobStatement(context, 7));
             Mockito.verify(analyzeMgr).killAllPendingTasks();
             Mockito.verify(analyzeMgr).removeAnalyzeJob(7);
             Mockito.verifyNoMoreInteractions(analyzeMgr);
@@ -118,9 +123,9 @@ public class AnalyzeAuthorizationTest {
 
         try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(
                 Authorizer.class, Mockito.CALLS_REAL_METHODS);
-                MockedStatic<GlobalStateMgr> globalStateMgr = Mockito.mockStatic(GlobalStateMgr.class)) {
-            authorizer.when(() -> Authorizer.checkSystemAction(context, PrivilegeType.OPERATE))
-                    .thenThrow(new AccessDeniedException());
+                MockedStatic<GlobalStateMgr> globalStateMgr =
+                        Mockito.mockStatic(GlobalStateMgr.class)) {
+            authorizer.when(() -> Authorizer.hasSystemOperate(context)).thenReturn(false);
             authorizer.when(() -> Authorizer.checkActionForAnalyzeStatement(
                             Mockito.eq(context), Mockito.any(TableName.class)))
                     .thenAnswer(invocation -> {
@@ -145,28 +150,34 @@ public class AnalyzeAuthorizationTest {
 
         try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(
                 Authorizer.class, Mockito.CALLS_REAL_METHODS);
-                MockedStatic<GlobalStateMgr> globalStateMgr = Mockito.mockStatic(GlobalStateMgr.class)) {
-            authorizer.when(() -> Authorizer.checkSystemAction(context, PrivilegeType.OPERATE)).thenAnswer(ignored -> null);
+                MockedStatic<GlobalStateMgr> globalStateMgr =
+                        Mockito.mockStatic(GlobalStateMgr.class)) {
+            authorizer.when(() -> Authorizer.hasSystemOperate(context)).thenReturn(true);
+            globalStateMgr.clearInvocations();
 
             Authorizer.checkPrivilegeForKillAnalyzeStatement(context, 7);
             Authorizer.checkPrivilegeForDropAnalyzeJobStatement(context, 7);
 
-            globalStateMgr.verify(GlobalStateMgr::getCurrentState, Mockito.times(1));
+            globalStateMgr.verifyNoInteractions();
         }
     }
 
     @Test
-    public void testAllAndUnknownIdsRequireOperateBeforeMetadataLookup() throws Exception {
+    public void testAllAndUnknownIdsRequireOperateWithMinimalMetadataLookup() {
         ConnectContext context = new ConnectContext();
 
         try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(
                 Authorizer.class, Mockito.CALLS_REAL_METHODS);
-                MockedStatic<GlobalStateMgr> globalStateMgr = Mockito.mockStatic(GlobalStateMgr.class)) {
-            authorizer.when(() -> Authorizer.checkSystemAction(context, PrivilegeType.OPERATE))
-                    .thenThrow(new AccessDeniedException(), new SecurityException("denied"));
+                MockedStatic<GlobalStateMgr> globalStateMgr =
+                        Mockito.mockStatic(GlobalStateMgr.class)) {
+            authorizer.when(() -> Authorizer.hasSystemOperate(context)).thenReturn(false);
+            authorizer.when(() -> Authorizer.checkSystemOperate(context))
+                    .thenThrow(new SecurityException("denied"));
+            globalStateMgr.clearInvocations();
+
             Assertions.assertThrows(SecurityException.class,
                     () -> Authorizer.checkPrivilegeForKillAnalyzeStatement(context, -1));
-            globalStateMgr.verify(GlobalStateMgr::getCurrentState, Mockito.times(1));
+            globalStateMgr.verifyNoInteractions();
         }
 
         GlobalStateMgr state = Mockito.mock(GlobalStateMgr.class);
@@ -174,10 +185,13 @@ public class AnalyzeAuthorizationTest {
         Mockito.when(state.getAnalyzeMgr()).thenReturn(analyzeMgr);
         try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(
                 Authorizer.class, Mockito.CALLS_REAL_METHODS);
-                MockedStatic<GlobalStateMgr> globalStateMgr = Mockito.mockStatic(GlobalStateMgr.class)) {
-            authorizer.when(() -> Authorizer.checkSystemAction(context, PrivilegeType.OPERATE))
-                    .thenThrow(new AccessDeniedException(), new SecurityException("denied"));
+                MockedStatic<GlobalStateMgr> globalStateMgr =
+                        Mockito.mockStatic(GlobalStateMgr.class)) {
+            authorizer.when(() -> Authorizer.hasSystemOperate(context)).thenReturn(false);
+            authorizer.when(() -> Authorizer.checkSystemOperate(context))
+                    .thenThrow(new SecurityException("denied"));
             globalStateMgr.when(GlobalStateMgr::getCurrentState).thenReturn(state);
+            globalStateMgr.clearInvocations();
 
             Assertions.assertThrows(SecurityException.class,
                     () -> Authorizer.checkPrivilegeForDropAnalyzeJobStatement(context, 404));
@@ -201,16 +215,82 @@ public class AnalyzeAuthorizationTest {
 
         try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(
                 Authorizer.class, Mockito.CALLS_REAL_METHODS);
-                MockedStatic<GlobalStateMgr> globalStateMgr = Mockito.mockStatic(GlobalStateMgr.class)) {
-            authorizer.when(() -> Authorizer.checkSystemAction(context, PrivilegeType.OPERATE))
-                    .thenThrow(new AccessDeniedException(), new SecurityException("denied"));
+                MockedStatic<GlobalStateMgr> globalStateMgr =
+                        Mockito.mockStatic(GlobalStateMgr.class)) {
+            authorizer.when(() -> Authorizer.hasSystemOperate(context)).thenReturn(false);
+            authorizer.when(() -> Authorizer.checkSystemOperate(context))
+                    .thenThrow(new SecurityException("denied"));
             globalStateMgr.when(GlobalStateMgr::getCurrentState).thenReturn(state);
+            globalStateMgr.clearInvocations();
 
             Assertions.assertThrows(SecurityException.class,
                     () -> Authorizer.checkPrivilegeForDropAnalyzeJobStatement(context, 9));
             Mockito.verify(analyzeMgr).getAnalyzeJob(9);
             Mockito.verifyNoMoreInteractions(analyzeMgr);
-            globalStateMgr.verify(GlobalStateMgr::getCurrentState, Mockito.times(2));
+            globalStateMgr.verify(GlobalStateMgr::getCurrentState, Mockito.times(1));
+        }
+    }
+
+    @Test
+    public void testResolvedAnalyzeTargetIsAuthorizedWithoutMetadataRequery() throws Exception {
+        ConnectContext context = new ConnectContext();
+        GlobalStateMgr state = Mockito.mock(GlobalStateMgr.class);
+        MetadataMgr metadataMgr = Mockito.mock(MetadataMgr.class);
+        Table table = Mockito.mock(Table.class);
+        TableName target = new TableName("external_catalog", "db", "tbl");
+        List<PrivilegeType> checkedActions = new ArrayList<>();
+        AtomicReference<TableName> checkedTarget = new AtomicReference<>();
+        Mockito.when(state.getMetadataMgr()).thenReturn(metadataMgr);
+        Mockito.when(metadataMgr.getTable(context, target))
+                .thenReturn(Optional.of(table), Optional.empty());
+        Mockito.when(table.getType()).thenReturn(Table.TableType.HIVE);
+        Mockito.when(table.isTable()).thenReturn(true);
+
+        try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(
+                Authorizer.class, Mockito.CALLS_REAL_METHODS);
+                MockedStatic<GlobalStateMgr> globalStateMgr =
+                        Mockito.mockStatic(GlobalStateMgr.class)) {
+            globalStateMgr.when(GlobalStateMgr::getCurrentState).thenReturn(state);
+            authorizer.when(() -> Authorizer.checkTableActionByName(
+                            Mockito.same(context), Mockito.any(TableName.class),
+                            Mockito.any(PrivilegeType.class)))
+                    .thenAnswer(invocation -> {
+                        checkedTarget.set(invocation.getArgument(1));
+                        checkedActions.add(invocation.getArgument(2));
+                        return null;
+                    });
+
+            Authorizer.checkActionForAnalyzeStatement(context, target);
+
+            Assertions.assertSame(target, checkedTarget.get());
+            Assertions.assertEquals(
+                    List.of(PrivilegeType.SELECT, PrivilegeType.INSERT), checkedActions);
+            Mockito.verify(metadataMgr).getTable(context, target);
+            Mockito.verifyNoMoreInteractions(metadataMgr);
+        }
+    }
+
+    @Test
+    public void testMissingAnalyzeTargetRequiresOperate() {
+        ConnectContext context = new ConnectContext();
+        GlobalStateMgr state = Mockito.mock(GlobalStateMgr.class);
+        MetadataMgr metadataMgr = Mockito.mock(MetadataMgr.class);
+        TableName target = new TableName("external_catalog", "db", "missing_tbl");
+        Mockito.when(state.getMetadataMgr()).thenReturn(metadataMgr);
+        Mockito.when(metadataMgr.getTable(context, target)).thenReturn(Optional.empty());
+
+        try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(
+                Authorizer.class, Mockito.CALLS_REAL_METHODS);
+                MockedStatic<GlobalStateMgr> globalStateMgr =
+                        Mockito.mockStatic(GlobalStateMgr.class)) {
+            globalStateMgr.when(GlobalStateMgr::getCurrentState).thenReturn(state);
+            authorizer.when(() -> Authorizer.checkSystemOperate(context))
+                    .thenThrow(new SecurityException("denied"));
+
+            Assertions.assertThrows(SecurityException.class,
+                    () -> Authorizer.checkActionForAnalyzeStatement(context, target));
+            Mockito.verify(metadataMgr).getTable(context, target);
+            Mockito.verifyNoMoreInteractions(metadataMgr);
         }
     }
 }

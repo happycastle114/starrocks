@@ -267,7 +267,7 @@ public class Authorizer {
     private static void checkSelectOnTableLikeObject(
             ConnectContext context, TableName tableName, Table table) {
         try {
-            doCheckTableLikeObject(context, tableName.getDb(), table, PrivilegeType.SELECT);
+            doCheckTableLikeObject(context, tableName, table, PrivilegeType.SELECT);
         } catch (AccessDeniedException e) {
             reportSelectDenied(context, tableName);
         }
@@ -319,19 +319,26 @@ public class Authorizer {
 
     public static void checkActionOnTableLikeObject(ConnectContext context, TableName tableName,
                                                     PrivilegeType privilegeType) throws AccessDeniedException {
-        Optional<Table> table = GlobalStateMgr.getCurrentState().getMetadataMgr().getTable(context, tableName);
+        Optional<Table> table = GlobalStateMgr.getCurrentState()
+                .getMetadataMgr().getTable(context, tableName);
         if (table.isPresent()) {
-            doCheckTableLikeObject(context, tableName.getDb(), table.get(), privilegeType);
+            doCheckTableLikeObject(context, tableName, table.get(), privilegeType);
         }
     }
 
     public static void checkAnyActionOnTableLikeObject(ConnectContext context, String dbName,
                                                        BasicTable tableBasicInfo) throws AccessDeniedException {
-        doCheckTableLikeObject(context, dbName, tableBasicInfo, null);
+        if (tableBasicInfo == null) {
+            return;
+        }
+        TableName tableName = new TableName(
+                tableBasicInfo.getCatalogName(), dbName, tableBasicInfo.getName());
+        doCheckTableLikeObject(context, tableName, tableBasicInfo, null);
     }
 
-    private static void doCheckTableLikeObject(ConnectContext context, String dbName,
-                                               BasicTable tbl, PrivilegeType privilegeType) throws AccessDeniedException {
+    private static void doCheckTableLikeObject(
+            ConnectContext context, TableName tableName, BasicTable tbl,
+            PrivilegeType privilegeType) throws AccessDeniedException {
         if (tbl == null) {
             return;
         }
@@ -357,27 +364,26 @@ public class Authorizer {
             case KUDU:
                 // `privilegeType == null` meaning we don't check specified action, just any action
                 if (privilegeType == null) {
-                    checkAnyActionOnTable(context, new TableName(tbl.getCatalogName(), dbName, tbl.getName()));
+                    checkAnyActionOnTable(context, tableName);
                 } else {
-                    checkTableAction(context, dbName, tbl.getName(), privilegeType);
+                    checkTableActionByName(context, tableName, privilegeType);
                 }
                 break;
             case MATERIALIZED_VIEW:
             case CLOUD_NATIVE_MATERIALIZED_VIEW:
                 // `privilegeType == null` meaning we don't check specified action, just any action
                 if (privilegeType == null) {
-                    checkAnyActionOnMaterializedView(context, new TableName(dbName, tbl.getName()));
+                    checkAnyActionOnMaterializedView(context, tableName);
                 } else {
-                    checkMaterializedViewAction(context, new TableName(dbName, tbl.getName()),
-                            privilegeType);
+                    checkMaterializedViewAction(context, tableName, privilegeType);
                 }
                 break;
             case VIEW:
                 // `privilegeType == null` meaning we don't check specified action, just any action
                 if (privilegeType == null) {
-                    checkAnyActionOnView(context, new TableName(dbName, tbl.getName()));
+                    checkAnyActionOnView(context, tableName);
                 } else {
-                    checkViewAction(context, new TableName(dbName, tbl.getName()), privilegeType);
+                    checkViewAction(context, tableName, privilegeType);
                 }
                 break;
             default:
@@ -386,24 +392,29 @@ public class Authorizer {
     }
 
     public static void checkActionForAnalyzeStatement(ConnectContext context, TableName tableName) {
+        Optional<Table> table = GlobalStateMgr.getCurrentState()
+                .getMetadataMgr().getTable(context, tableName);
+        if (table.isEmpty()) {
+            checkSystemOperate(context);
+            return;
+        }
+
+        Table target = table.get();
+        checkAnalyzeTargetAction(context, tableName, target, PrivilegeType.SELECT);
+        if (target.isTable()) {
+            checkAnalyzeTargetAction(context, tableName, target, PrivilegeType.INSERT);
+        }
+    }
+
+    private static void checkAnalyzeTargetAction(
+            ConnectContext context, TableName tableName, Table table, PrivilegeType privilegeType) {
         try {
-            Authorizer.checkActionOnTableLikeObject(context, tableName, PrivilegeType.SELECT);
+            doCheckTableLikeObject(context, tableName, table, privilegeType);
         } catch (AccessDeniedException e) {
             AccessDeniedException.reportAccessDenied(
                     tableName.getCatalog(),
                     context.getCurrentUserIdentity(), context.getCurrentRoleIds(),
-                    PrivilegeType.SELECT.name(), ObjectType.TABLE.name(), tableName.getTbl());
-        }
-        Optional<Table> table = GlobalStateMgr.getCurrentState().getMetadataMgr().getTable(context, tableName);
-        if (table.isPresent() && table.get().isTable()) {
-            try {
-                Authorizer.checkActionOnTableLikeObject(context, tableName, PrivilegeType.INSERT);
-            } catch (AccessDeniedException e) {
-                AccessDeniedException.reportAccessDenied(
-                        tableName.getCatalog(),
-                        context.getCurrentUserIdentity(), context.getCurrentRoleIds(),
-                        PrivilegeType.INSERT.name(), ObjectType.TABLE.name(), tableName.getTbl());
-            }
+                    privilegeType.name(), ObjectType.TABLE.name(), tableName.getTbl());
         }
     }
 
@@ -475,10 +486,6 @@ public class Authorizer {
     }
 
     private static void checkPrivilegeForAnalyzeTarget(ConnectContext context, TableName tableName) {
-        if (GlobalStateMgr.getCurrentState().getMetadataMgr().getTable(context, tableName).isEmpty()) {
-            checkSystemOperate(context);
-            return;
-        }
         checkActionForAnalyzeStatement(context, tableName);
     }
 
