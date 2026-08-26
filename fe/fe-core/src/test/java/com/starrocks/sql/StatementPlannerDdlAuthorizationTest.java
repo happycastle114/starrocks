@@ -63,6 +63,77 @@ public class StatementPlannerDdlAuthorizationTest extends PlanTestBase {
     }
 
     @Test
+    public void testDeniedTemporaryTableLikeSourceDoesNotReachAnalyzer() {
+        StatementBase statement = parse(
+                "CREATE TEMPORARY TABLE denied_temp LIKE missing_temp_source");
+        AtomicInteger analyzerCalls = mockAnalyzer();
+        TableName source = new TableName(
+                InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, "test", "missing_temp_source");
+
+        try (MockedStatic<Authorizer> authorizer =
+                     Mockito.mockStatic(Authorizer.class, Mockito.CALLS_REAL_METHODS)) {
+            authorizer.when(() -> Authorizer.checkSelectOnUnresolvedTableLikeObject(
+                            connectContext, source))
+                    .thenThrow(new SecurityException("SELECT denied"));
+            authorizer.clearInvocations();
+
+            Assertions.assertThrows(SecurityException.class,
+                    () -> StatementPlanner.plan(statement, connectContext));
+            Assertions.assertEquals(0, analyzerCalls.get());
+            authorizer.verify(() -> Authorizer.checkSelectOnUnresolvedTableLikeObject(
+                    connectContext, source), Mockito.times(1));
+        }
+    }
+
+    @Test
+    public void testDeniedPlanAdvisorSourceDoesNotReachAnalyzer() {
+        StatementBase statement = parse(
+                "ALTER PLAN ADVISOR ADD SELECT * FROM db1.missing_advisor_source");
+        AtomicInteger analyzerCalls = mockAnalyzer();
+        TableName source = new TableName(
+                InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME,
+                "db1", "missing_advisor_source");
+
+        try (MockedStatic<Authorizer> authorizer =
+                     Mockito.mockStatic(Authorizer.class, Mockito.CALLS_REAL_METHODS)) {
+            authorizer.when(() -> Authorizer.checkSelectOnUnresolvedTableLikeObject(
+                            connectContext, source))
+                    .thenThrow(new SecurityException("SELECT denied"));
+            authorizer.clearInvocations();
+
+            Assertions.assertThrows(SecurityException.class,
+                    () -> StatementPlanner.plan(statement, connectContext));
+            Assertions.assertEquals(0, analyzerCalls.get());
+            authorizer.verify(() -> Authorizer.checkSelectOnUnresolvedTableLikeObject(
+                    connectContext, source), Mockito.times(1));
+        }
+    }
+
+    @Test
+    public void testPlanAdvisorCteScopeAuthorizesOnlyPhysicalSources() {
+        StatementBase statement = parse(
+                "ALTER PLAN ADVISOR ADD WITH source_cte AS "
+                        + "(SELECT * FROM physical_source), physical_source AS (SELECT 1) "
+                        + "SELECT * FROM source_cte");
+        AtomicInteger analyzerCalls = mockAnalyzer();
+        TableName physicalSource = new TableName(
+                InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, "test", "physical_source");
+        TableName cteSource = new TableName(
+                InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, "test", "source_cte");
+
+        try (MockedStatic<Authorizer> authorizer =
+                     Mockito.mockStatic(Authorizer.class, Mockito.CALLS_REAL_METHODS)) {
+            Assertions.assertThrows(StopPlanningException.class,
+                    () -> StatementPlanner.plan(statement, connectContext));
+            Assertions.assertEquals(1, analyzerCalls.get());
+            authorizer.verify(() -> Authorizer.checkSelectOnUnresolvedTableLikeObject(
+                    connectContext, physicalSource), Mockito.times(1));
+            authorizer.verify(() -> Authorizer.checkSelectOnUnresolvedTableLikeObject(
+                    connectContext, cteSource), Mockito.never());
+        }
+    }
+
+    @Test
     public void testDeniedCreateViewWrappersDoNotReachAnalyzer() {
         List<StatementBase> statements = List.of(
                 parse("CREATE VIEW denied_view AS SELECT 1"),

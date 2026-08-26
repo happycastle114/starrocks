@@ -175,6 +175,58 @@ public class Authorizer {
                 .checkTableAction(context, tableName, privilegeType);
     }
 
+    public static void checkSelectOnUnresolvedTableLikeObject(
+            ConnectContext context, TableName tableName) {
+        AccessControlProvider accessControlProvider = getInstance();
+        accessControlProvider.validateAccessControlContext(context);
+        if (CatalogMgr.isInternalCatalog(tableName.getCatalog())) {
+            Table table = getInternalTableLikeObject(context, tableName);
+            if (table == null) {
+                return;
+            }
+            checkSelectOnTableLikeObject(context, tableName, table);
+            return;
+        }
+
+        try {
+            accessControlProvider.getAccessControlOrDefault(tableName.getCatalog(), context)
+                    .checkTableAction(context, tableName, PrivilegeType.SELECT);
+        } catch (AccessDeniedException e) {
+            reportSelectDenied(context, tableName);
+        }
+    }
+
+    private static Table getInternalTableLikeObject(
+            ConnectContext context, TableName tableName) {
+        GlobalStateMgr globalState = GlobalStateMgr.getCurrentState();
+        Database database = globalState.getLocalMetastore().getDb(tableName.getDb());
+        if (database == null) {
+            return null;
+        }
+        Table temporaryTable = globalState.getMetadataMgr().getTemporaryTable(
+                context.getSessionId(), tableName.getCatalog(),
+                database.getId(), tableName.getTbl());
+        return temporaryTable != null
+                ? temporaryTable
+                : globalState.getLocalMetastore().getTable(tableName.getDb(), tableName.getTbl());
+    }
+
+    private static void checkSelectOnTableLikeObject(
+            ConnectContext context, TableName tableName, Table table) {
+        try {
+            doCheckTableLikeObject(context, tableName.getDb(), table, PrivilegeType.SELECT);
+        } catch (AccessDeniedException e) {
+            reportSelectDenied(context, tableName);
+        }
+    }
+
+    private static void reportSelectDenied(ConnectContext context, TableName tableName) {
+        AccessDeniedException.reportAccessDenied(
+                tableName.getCatalog(), context.getCurrentUserIdentity(),
+                context.getCurrentRoleIds(),
+                PrivilegeType.SELECT.name(), ObjectType.TABLE.name(), tableName.getTbl());
+    }
+
     public static void checkAnyActionOnTable(ConnectContext context, TableName tableName)
             throws AccessDeniedException {
         String catalog = tableName.getCatalog();
@@ -377,7 +429,11 @@ public class Authorizer {
         checkActionForAnalyzeStatement(context, tableName);
     }
 
-    private static boolean hasSystemOperate(ConnectContext context) {
+    public static boolean hasSystemOperate(ConnectContext context) {
+        if (context.isBypassAuthorizerCheck()) {
+            return true;
+        }
+        getInstance().validateAccessControlContext(context);
         try {
             checkSystemAction(context, PrivilegeType.OPERATE);
             return true;
@@ -387,6 +443,10 @@ public class Authorizer {
     }
 
     public static void checkSystemOperate(ConnectContext context) {
+        if (context.isBypassAuthorizerCheck()) {
+            return;
+        }
+        getInstance().validateAccessControlContext(context);
         try {
             checkSystemAction(context, PrivilegeType.OPERATE);
         } catch (AccessDeniedException e) {

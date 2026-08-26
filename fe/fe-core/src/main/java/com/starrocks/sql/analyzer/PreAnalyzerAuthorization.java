@@ -22,6 +22,8 @@ import com.starrocks.catalog.InternalCatalog;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.CatalogMgr;
 import com.starrocks.sql.ast.AlterViewStmt;
+import com.starrocks.sql.ast.AstTraverser;
+import com.starrocks.sql.ast.CTERelation;
 import com.starrocks.sql.ast.CreateFunctionStmt;
 import com.starrocks.sql.ast.CreateMaterializedViewStatement;
 import com.starrocks.sql.ast.CreateMaterializedViewStmt;
@@ -35,13 +37,20 @@ import com.starrocks.sql.ast.FileTableFunctionRelation;
 import com.starrocks.sql.ast.InsertStmt;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.SelectRelation;
+import com.starrocks.sql.ast.SetOperationRelation;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.SubmitTaskStmt;
 import com.starrocks.sql.ast.TableRelation;
 import com.starrocks.sql.ast.UpdateStmt;
 import com.starrocks.sql.ast.UserVariable;
+import com.starrocks.sql.ast.feedback.AddPlanAdvisorStmt;
 import com.starrocks.sql.ast.feedback.PlanAdvisorStmt;
 import com.starrocks.sql.ast.pipe.CreatePipeStmt;
+
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.HashSet;
+import java.util.Set;
 
 public final class PreAnalyzerAuthorization {
     public enum Result {
@@ -128,6 +137,7 @@ public final class PreAnalyzerAuthorization {
     private static boolean authorizeMetadataControlBefore(
             StatementBase statement, ConnectContext session) {
         if (!(statement instanceof CreateTemporaryTableStmt)
+                && !(statement instanceof CreateTemporaryTableLikeStmt)
                 && !(statement instanceof PlanAdvisorStmt)) {
             return false;
         }
@@ -138,6 +148,9 @@ public final class PreAnalyzerAuthorization {
             checkCreateTemporaryTableSource(createLike.getExistedDbTbl(), session);
         } else if (statement instanceof CreateTemporaryTableStmt createTemporaryTable) {
             checkCreateTemporaryTableTarget(createTemporaryTable.getDbTbl(), session);
+        } else if (statement instanceof AddPlanAdvisorStmt addPlanAdvisor) {
+            Authorizer.checkSystemOperate(session);
+            authorizePlanAdvisorQueryBefore(addPlanAdvisor.getQueryStmt(), session);
         } else {
             Authorizer.checkSystemOperate(session);
         }
@@ -153,7 +166,7 @@ public final class PreAnalyzerAuthorization {
     private static void checkCreateTemporaryTableSource(
             TableName source, ConnectContext session) {
         TableName resolvedSource = resolveTableName(source, session);
-        checkTableTargetActionByName(resolvedSource, PrivilegeType.SELECT, session);
+        Authorizer.checkSelectOnUnresolvedTableLikeObject(session, resolvedSource);
     }
 
     private static TableName resolveTableName(
@@ -163,6 +176,84 @@ public final class PreAnalyzerAuthorization {
         String db = tableName.getDb() == null
                 ? session.getDatabase() : tableName.getDb();
         return new TableName(catalog, db, tableName.getTbl());
+    }
+
+    private static void authorizePlanAdvisorQueryBefore(
+            QueryStatement queryStatement, ConnectContext session) {
+        Authorizer.checkRangerManagedQueryBeforeAnalysis(queryStatement, session);
+        new UnresolvedQueryAuthorizationVisitor(session).visit(queryStatement);
+    }
+
+    private static final class UnresolvedQueryAuthorizationVisitor
+            extends AstTraverser<Void, Void> {
+        private final ConnectContext session;
+        private final Deque<Set<String>> cteNameStack = new ArrayDeque<>();
+
+        private UnresolvedQueryAuthorizationVisitor(ConnectContext session) {
+            this.session = session;
+        }
+
+        @Override
+        public Void visitSelect(SelectRelation relation, Void context) {
+            if (!relation.hasWithClause()) {
+                return super.visitSelect(relation, context);
+            }
+            cteNameStack.push(new HashSet<>());
+            try {
+                return super.visitSelect(relation, context);
+            } finally {
+                cteNameStack.pop();
+            }
+        }
+
+        @Override
+        public Void visitSetOp(SetOperationRelation relation, Void context) {
+            if (!relation.hasWithClause()) {
+                return super.visitSetOp(relation, context);
+            }
+            cteNameStack.push(new HashSet<>());
+            try {
+                return super.visitSetOp(relation, context);
+            } finally {
+                cteNameStack.pop();
+            }
+        }
+
+        @Override
+        public Void visitCTE(CTERelation relation, Void context) {
+            Void result = super.visitCTE(relation, context);
+            if (!cteNameStack.isEmpty() && relation.getName() != null) {
+                cteNameStack.peek().add(relation.getName());
+            }
+            return result;
+        }
+
+        @Override
+        public Void visitTable(TableRelation relation, Void context) {
+            TableName tableName = relation.getName();
+            if (tableName == null || isCteReference(tableName)) {
+                return null;
+            }
+            Authorizer.checkSelectOnUnresolvedTableLikeObject(
+                    session, resolveTableName(tableName, session));
+            return null;
+        }
+
+        private boolean isCteReference(TableName tableName) {
+            if (!isEmpty(tableName.getCatalog()) || !isEmpty(tableName.getDb())) {
+                return false;
+            }
+            for (Set<String> names : cteNameStack) {
+                if (names.contains(tableName.getTbl())) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private boolean isEmpty(String value) {
+            return value == null || value.isEmpty();
+        }
     }
 
     public static void checkRangerManagedQuery(

@@ -40,6 +40,7 @@ import com.starrocks.catalog.BrokerMgr;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.FsBroker;
 import com.starrocks.catalog.Function;
+import com.starrocks.catalog.InternalCatalog;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Replica;
 import com.starrocks.catalog.ScalarFunction;
@@ -453,6 +454,52 @@ public class PrivilegeCheckerTest extends StarRocksTestBase {
         } finally {
             ctxToRoot();
             grantOrRevoke("revoke create table on database db1 from test");
+        }
+    }
+
+    @Test
+    public void testUnresolvedTableLikeAuthorizationUsesActualObjectType() throws Exception {
+        ConnectContext ctx = starRocksAssert.getCtx();
+        TableName tableName = new TableName(
+                InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, "db1", "tbl1");
+        TableName materializedViewName = new TableName(
+                InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, "db3", "mv1");
+        ctxToTestUser();
+
+        RuntimeException denied = Assertions.assertThrows(RuntimeException.class,
+                () -> Authorizer.checkSelectOnUnresolvedTableLikeObject(ctx, tableName));
+        Assertions.assertTrue(denied.getMessage().contains("SELECT"), denied.getMessage());
+        RuntimeException materializedViewDenied = Assertions.assertThrows(RuntimeException.class,
+                () -> Authorizer.checkSelectOnUnresolvedTableLikeObject(
+                        ctx, materializedViewName));
+        Assertions.assertTrue(
+                materializedViewDenied.getMessage().contains("SELECT"),
+                materializedViewDenied.getMessage());
+        Assertions.assertDoesNotThrow(() -> Authorizer.checkSelectOnUnresolvedTableLikeObject(
+                ctx, new TableName(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME,
+                        "db1", "missing_table_like_object")));
+
+        ctxToRoot();
+        grantOrRevoke("grant select on table db1.tbl1 to test");
+        try {
+            ctxToTestUser();
+            Assertions.assertDoesNotThrow(
+                    () -> Authorizer.checkSelectOnUnresolvedTableLikeObject(ctx, tableName));
+        } finally {
+            ctxToRoot();
+            grantOrRevoke("revoke select on table db1.tbl1 from test");
+        }
+
+        ctxToRoot();
+        grantOrRevoke("grant select on materialized view db3.mv1 to test");
+        try {
+            ctxToTestUser();
+            Assertions.assertDoesNotThrow(
+                    () -> Authorizer.checkSelectOnUnresolvedTableLikeObject(
+                            ctx, materializedViewName));
+        } finally {
+            ctxToRoot();
+            grantOrRevoke("revoke select on materialized view db3.mv1 from test");
         }
     }
 
