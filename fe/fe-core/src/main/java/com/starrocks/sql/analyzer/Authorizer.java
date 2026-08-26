@@ -31,6 +31,7 @@ import com.starrocks.catalog.Database;
 import com.starrocks.catalog.Function;
 import com.starrocks.catalog.InternalCatalog;
 import com.starrocks.catalog.Table;
+import com.starrocks.common.MetaNotFoundException;
 import com.starrocks.common.Pair;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.CatalogMgr;
@@ -40,12 +41,17 @@ import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.sql.ast.pipe.PipeName;
+import com.starrocks.statistic.AnalyzeJob;
+import com.starrocks.statistic.AnalyzeMgr;
+import com.starrocks.statistic.AnalyzeStatus;
+import com.starrocks.statistic.NativeAnalyzeJob;
 import com.starrocks.warehouse.Warehouse;
 import org.apache.commons.collections4.ListUtils;
 
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 public class Authorizer {
     private final AccessControlProvider accessControlProvider;
@@ -293,6 +299,101 @@ public class Authorizer {
                         context.getCurrentUserIdentity(), context.getCurrentRoleIds(),
                         PrivilegeType.INSERT.name(), ObjectType.TABLE.name(), tableName.getTbl());
             }
+        }
+    }
+
+    public static void checkPrivilegeForKillAnalyzeStatement(ConnectContext context, long analyzeId) {
+        if (hasSystemOperate(context)) {
+            return;
+        }
+        if (analyzeId == -1) {
+            checkSystemOperate(context);
+            return;
+        }
+
+        AnalyzeMgr analyzeMgr = GlobalStateMgr.getCurrentState().getAnalyzeMgr();
+        AnalyzeStatus analyzeStatus = analyzeMgr.getAnalyzeStatus(analyzeId);
+        if (analyzeStatus != null) {
+            try {
+                checkPrivilegeForAnalyzeTarget(context, new TableName(
+                        analyzeStatus.getCatalogName(), analyzeStatus.getDbName(), analyzeStatus.getTableName()));
+                return;
+            } catch (MetaNotFoundException e) {
+                checkSystemOperate(context);
+                return;
+            }
+        }
+
+        checkPrivilegeForAnalyzeJob(context, analyzeMgr.getAnalyzeJob(analyzeId));
+    }
+
+    public static void checkPrivilegeForDropAnalyzeJobStatement(ConnectContext context, long analyzeId) {
+        if (hasSystemOperate(context)) {
+            return;
+        }
+        if (analyzeId == -1) {
+            checkSystemOperate(context);
+            return;
+        }
+
+        AnalyzeJob analyzeJob = GlobalStateMgr.getCurrentState().getAnalyzeMgr().getAnalyzeJob(analyzeId);
+        checkPrivilegeForAnalyzeJob(context, analyzeJob);
+    }
+
+    private static void checkPrivilegeForAnalyzeJob(ConnectContext context, AnalyzeJob analyzeJob) {
+        if (analyzeJob == null) {
+            checkSystemOperate(context);
+            return;
+        }
+        if (analyzeJob.isAnalyzeAllDb() || analyzeJob.isAnalyzeAllTable()) {
+            checkSystemOperate(context);
+            return;
+        }
+
+        try {
+            if (analyzeJob.isNative()) {
+                NativeAnalyzeJob nativeAnalyzeJob = (NativeAnalyzeJob) analyzeJob;
+                Set<TableName> tableNames = AnalyzerUtils.getAllTableNamesForAnalyzeJobStmt(
+                        nativeAnalyzeJob.getDbId(), nativeAnalyzeJob.getTableId());
+                if (tableNames.isEmpty()) {
+                    checkSystemOperate(context);
+                    return;
+                }
+                tableNames.forEach(tableName -> checkPrivilegeForAnalyzeTarget(context, tableName));
+            } else {
+                checkPrivilegeForAnalyzeTarget(context, new TableName(
+                        analyzeJob.getCatalogName(), analyzeJob.getDbName(), analyzeJob.getTableName()));
+            }
+        } catch (MetaNotFoundException e) {
+            checkSystemOperate(context);
+        }
+    }
+
+    private static void checkPrivilegeForAnalyzeTarget(ConnectContext context, TableName tableName) {
+        if (GlobalStateMgr.getCurrentState().getMetadataMgr().getTable(context, tableName).isEmpty()) {
+            checkSystemOperate(context);
+            return;
+        }
+        checkActionForAnalyzeStatement(context, tableName);
+    }
+
+    private static boolean hasSystemOperate(ConnectContext context) {
+        try {
+            checkSystemAction(context, PrivilegeType.OPERATE);
+            return true;
+        } catch (AccessDeniedException e) {
+            return false;
+        }
+    }
+
+    private static void checkSystemOperate(ConnectContext context) {
+        try {
+            checkSystemAction(context, PrivilegeType.OPERATE);
+        } catch (AccessDeniedException e) {
+            AccessDeniedException.reportAccessDenied(
+                    InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME,
+                    context.getCurrentUserIdentity(), context.getCurrentRoleIds(),
+                    PrivilegeType.OPERATE.name(), ObjectType.SYSTEM.name(), null);
         }
     }
 

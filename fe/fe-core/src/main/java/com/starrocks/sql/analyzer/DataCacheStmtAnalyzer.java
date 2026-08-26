@@ -18,8 +18,12 @@ import com.google.common.collect.ImmutableList;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.TableName;
+import com.starrocks.authorization.AccessDeniedException;
+import com.starrocks.authorization.ObjectType;
+import com.starrocks.authorization.PrivilegeType;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
+import com.starrocks.catalog.InternalCatalog;
 import com.starrocks.catalog.Table;
 import com.starrocks.datacache.DataCacheMgr;
 import com.starrocks.qe.ConnectContext;
@@ -53,14 +57,14 @@ public class DataCacheStmtAnalyzer {
     }
 
     static class DataCacheStmtAnalyzerVisitor implements AstVisitor<Void, ConnectContext> {
-        private final DataCacheMgr dataCacheMgr = DataCacheMgr.getInstance();
-
         public void analyze(StatementBase statement, ConnectContext session) {
             visit(statement, session);
         }
 
         @Override
         public Void visitCreateDataCacheRuleStatement(CreateDataCacheRuleStmt statement, ConnectContext context) {
+            checkSystemOperate(context);
+
             int priority = statement.getPriority();
             if (priority != -1) {
                 throw new SemanticException("DataCache only support priority = -1 (aka BlackList) now");
@@ -78,6 +82,8 @@ public class DataCacheStmtAnalyzer {
             String dbName = parts.get(1);
             String tblName = parts.get(2);
 
+            checkConcreteTargetVisibility(context, catalogName, dbName, tblName);
+
             if (CatalogMgr.isInternalCatalog(catalogName)) {
                 throw new SemanticException("DataCache only support external catalog now");
             }
@@ -88,7 +94,7 @@ public class DataCacheStmtAnalyzer {
             Optional<Table> optionalTable = getTable(context, catalogName, dbName, tblName);
 
             // Check new dataCache rule is conflicted with existed rule
-            dataCacheMgr.throwExceptionIfRuleIsConflicted(catalogName, dbName, tblName);
+            DataCacheMgr.getInstance().throwExceptionIfRuleIsConflicted(catalogName, dbName, tblName);
 
             Expr predicates = statement.getPredicates();
             if (predicates != null) {
@@ -112,8 +118,10 @@ public class DataCacheStmtAnalyzer {
 
         @Override
         public Void visitDropDataCacheRuleStatement(DropDataCacheRuleStmt statement, ConnectContext context) {
+            checkSystemOperate(context);
+
             long cacheRuleId = statement.getCacheRuleId();
-            if (!dataCacheMgr.isExistCacheRule(cacheRuleId)) {
+            if (!DataCacheMgr.getInstance().isExistCacheRule(cacheRuleId)) {
                 throw new SemanticException(String.format("DataCache rule id = %d does not exist", cacheRuleId));
             }
             return null;
@@ -121,6 +129,7 @@ public class DataCacheStmtAnalyzer {
 
         @Override
         public Void visitClearDataCacheRulesStatement(ClearDataCacheRulesStmt statement, ConnectContext context) {
+            checkSystemOperate(context);
             return null;
         }
 
@@ -168,6 +177,32 @@ public class DataCacheStmtAnalyzer {
             statement.setTTLSeconds(ttlSeconds);
 
             return null;
+        }
+
+        private static void checkSystemOperate(ConnectContext context) {
+            try {
+                Authorizer.checkSystemAction(context, PrivilegeType.OPERATE);
+            } catch (AccessDeniedException e) {
+                AccessDeniedException.reportAccessDenied(
+                        InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME,
+                        context.getCurrentUserIdentity(), context.getCurrentRoleIds(),
+                        PrivilegeType.OPERATE.name(), ObjectType.SYSTEM.name(), null);
+            }
+        }
+
+        private static void checkConcreteTargetVisibility(
+                ConnectContext context, String catalogName, String dbName, String tableName) {
+            if (isSelectAll(catalogName) || isSelectAll(dbName) || isSelectAll(tableName)) {
+                return;
+            }
+            try {
+                Authorizer.checkAnyActionOnTable(
+                        context, new TableName(catalogName, dbName, tableName));
+            } catch (AccessDeniedException e) {
+                AccessDeniedException.reportAccessDenied(
+                        catalogName, context.getCurrentUserIdentity(), context.getCurrentRoleIds(),
+                        PrivilegeType.ANY.name(), ObjectType.TABLE.name(), tableName);
+            }
         }
     }
 

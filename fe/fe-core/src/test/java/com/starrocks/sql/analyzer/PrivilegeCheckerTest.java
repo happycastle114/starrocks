@@ -788,7 +788,13 @@ public class PrivilegeCheckerTest extends StarRocksTestBase {
             Assertions.assertTrue(e.getMessage().contains("Access denied;"));
         }
         grantRevokeSqlAsRoot("grant SELECT,INSERT on db2.tbl1 to test");
-        new StmtExecutor(ctx, new KillAnalyzeStmt(0L)).checkPrivilegeForKillAnalyzeStmt(ctx, nativeAnalyzeJob.getId());
+        long globalAnalyzeJobId = nativeAnalyzeJob.getId();
+        Assertions.assertThrows(ErrorReportException.class,
+                () -> new StmtExecutor(ctx, new KillAnalyzeStmt(0L))
+                        .checkPrivilegeForKillAnalyzeStmt(ctx, globalAnalyzeJobId));
+        grantRevokeSqlAsRoot("grant OPERATE on SYSTEM to test");
+        new StmtExecutor(ctx, new KillAnalyzeStmt(0L)).checkPrivilegeForKillAnalyzeStmt(ctx, globalAnalyzeJobId);
+        grantRevokeSqlAsRoot("revoke OPERATE on SYSTEM from test");
         grantRevokeSqlAsRoot("revoke SELECT,INSERT on db1.tbl1 from test");
         grantRevokeSqlAsRoot("revoke SELECT,INSERT on db1.tbl2 from test");
         grantRevokeSqlAsRoot("revoke SELECT,INSERT on db2.tbl1 from test");
@@ -814,7 +820,13 @@ public class PrivilegeCheckerTest extends StarRocksTestBase {
             Assertions.assertTrue(e.getMessage().contains("Access denied;"));
         }
         grantRevokeSqlAsRoot("grant SELECT,INSERT on db1.tbl2 to test");
-        new StmtExecutor(ctx, new KillAnalyzeStmt(0L)).checkPrivilegeForKillAnalyzeStmt(ctx, nativeAnalyzeJob.getId());
+        long allTablesInDbAnalyzeJobId = nativeAnalyzeJob.getId();
+        Assertions.assertThrows(ErrorReportException.class,
+                () -> new StmtExecutor(ctx, new KillAnalyzeStmt(0L))
+                        .checkPrivilegeForKillAnalyzeStmt(ctx, allTablesInDbAnalyzeJobId));
+        grantRevokeSqlAsRoot("grant OPERATE on SYSTEM to test");
+        new StmtExecutor(ctx, new KillAnalyzeStmt(0L)).checkPrivilegeForKillAnalyzeStmt(ctx, allTablesInDbAnalyzeJobId);
+        grantRevokeSqlAsRoot("revoke OPERATE on SYSTEM from test");
         grantRevokeSqlAsRoot("revoke SELECT,INSERT on db1.tbl1 from test");
         grantRevokeSqlAsRoot("revoke SELECT,INSERT on db1.tbl2 from test");
 

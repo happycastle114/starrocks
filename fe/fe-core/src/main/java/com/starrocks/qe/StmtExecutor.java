@@ -73,7 +73,6 @@ import com.starrocks.common.DdlException;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
 import com.starrocks.common.FeConstants;
-import com.starrocks.common.MetaNotFoundException;
 import com.starrocks.common.NoAliveBackendException;
 import com.starrocks.common.Pair;
 import com.starrocks.common.QueryDumpLog;
@@ -222,14 +221,12 @@ import com.starrocks.sql.optimizer.operator.physical.PhysicalValuesOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.statistics.StatisticStorage;
 import com.starrocks.sql.plan.ExecPlan;
-import com.starrocks.statistic.AnalyzeJob;
 import com.starrocks.statistic.AnalyzeMgr;
 import com.starrocks.statistic.AnalyzeStatus;
 import com.starrocks.statistic.CancelableAnalyzeTask;
 import com.starrocks.statistic.ExternalAnalyzeStatus;
 import com.starrocks.statistic.ExternalHistogramStatisticsCollectJob;
 import com.starrocks.statistic.HistogramStatisticsCollectJob;
-import com.starrocks.statistic.NativeAnalyzeJob;
 import com.starrocks.statistic.NativeAnalyzeStatus;
 import com.starrocks.statistic.StatisticExecutor;
 import com.starrocks.statistic.StatisticUtils;
@@ -2101,53 +2098,18 @@ public class StmtExecutor {
 
     private void handleKillAnalyzeStmt() {
         KillAnalyzeStmt killAnalyzeStmt = (KillAnalyzeStmt) parsedStmt;
-        AnalyzeMgr analyzeManager = GlobalStateMgr.getCurrentState().getAnalyzeMgr();
+        long analyzeId = killAnalyzeStmt.getAnalyzeId();
+        checkPrivilegeForKillAnalyzeStmt(context, analyzeId);
         if (killAnalyzeStmt.isKillAllPendingTasks()) {
-            analyzeManager.killAllPendingTasks();
+            GlobalStateMgr.getCurrentState().getAnalyzeMgr().killAllPendingTasks();
         } else {
-            long analyzeId = killAnalyzeStmt.getAnalyzeId();
-            checkPrivilegeForKillAnalyzeStmt(context, analyzeId);
             // Try to kill the job anyway.
-            analyzeManager.killConnection(analyzeId);
+            GlobalStateMgr.getCurrentState().getAnalyzeMgr().killConnection(analyzeId);
         }
-    }
-
-    private void checkTblPrivilegeForKillAnalyzeStmt(ConnectContext context, String catalogName, String dbName,
-                                                     String tableName) {
-        Database db = GlobalStateMgr.getCurrentState().getMetadataMgr().getDb(context, catalogName, dbName);
-        if (db == null) {
-            ErrorReport.reportSemanticException(ErrorCode.ERR_BAD_DB_ERROR, dbName);
-        }
-
-        Table table = GlobalStateMgr.getCurrentState().getMetadataMgr().getTable(context, catalogName, dbName, tableName);
-        if (table == null) {
-            throw new SemanticException("Table %s is not found", tableName);
-        }
-        Authorizer.checkActionForAnalyzeStatement(context, new TableName(catalogName, dbName, tableName));
     }
 
     public void checkPrivilegeForKillAnalyzeStmt(ConnectContext context, long analyzeId) {
-        AnalyzeMgr analyzeManager = GlobalStateMgr.getCurrentState().getAnalyzeMgr();
-        AnalyzeStatus analyzeStatus = analyzeManager.getAnalyzeStatus(analyzeId);
-        AnalyzeJob analyzeJob = analyzeManager.getAnalyzeJob(analyzeId);
-        if (analyzeStatus != null) {
-            try {
-                String catalogName = analyzeStatus.getCatalogName();
-                String dbName = analyzeStatus.getDbName();
-                String tableName = analyzeStatus.getTableName();
-                checkTblPrivilegeForKillAnalyzeStmt(context, catalogName, dbName, tableName);
-            } catch (MetaNotFoundException ignore) {
-                // If the db or table doesn't exist anymore, we won't check privilege on it
-            }
-        } else if (analyzeJob != null && analyzeJob.isNative()) {
-            NativeAnalyzeJob nativeAnalyzeJob = (NativeAnalyzeJob) analyzeJob;
-            Set<TableName> tableNames = AnalyzerUtils.getAllTableNamesForAnalyzeJobStmt(nativeAnalyzeJob.getDbId(),
-                    nativeAnalyzeJob.getTableId());
-            tableNames.forEach(tableName ->
-                    checkTblPrivilegeForKillAnalyzeStmt(context, tableName.getCatalog(), tableName.getDb(),
-                            tableName.getTbl())
-            );
-        }
+        Authorizer.checkPrivilegeForKillAnalyzeStatement(context, analyzeId);
     }
 
     private void handleAddSqlBlackListStmt() {

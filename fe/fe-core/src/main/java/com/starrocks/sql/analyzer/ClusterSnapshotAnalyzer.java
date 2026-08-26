@@ -14,6 +14,10 @@
 
 package com.starrocks.sql.analyzer;
 
+import com.starrocks.authorization.AccessDeniedException;
+import com.starrocks.authorization.ObjectType;
+import com.starrocks.authorization.PrivilegeType;
+import com.starrocks.catalog.InternalCatalog;
 import com.starrocks.common.DdlException;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
@@ -37,6 +41,9 @@ public class ClusterSnapshotAnalyzer {
             if (!RunMode.isSharedDataMode()) {
                 throw new SemanticException("Automated snapshot only support share data mode");
             }
+
+            checkSystemOperate(context);
+            checkStorageVolumeUsage(context, statement.getStorageVolumeName());
 
             if (GlobalStateMgr.getCurrentState().getClusterSnapshotMgr().isAutomatedSnapshotOn()) {
                 throw new SemanticException("Automated snapshot has been turn on");
@@ -73,6 +80,8 @@ public class ClusterSnapshotAnalyzer {
                 throw new SemanticException("Automated snapshot only support share data mode");
             }
 
+            checkSystemOperate(context);
+
             if (!GlobalStateMgr.getCurrentState().getClusterSnapshotMgr().isAutomatedSnapshotOn()) {
                 throw new SemanticException("Automated snapshot has not been turn on");
             }
@@ -86,6 +95,8 @@ public class ClusterSnapshotAnalyzer {
             if (!RunMode.isSharedDataMode()) {
                 throw new SemanticException("Automated snapshot only support share data mode");
             }
+
+            checkSystemOperate(context);
 
             if (!GlobalStateMgr.getCurrentState().getClusterSnapshotMgr().isAutomatedSnapshotOn()) {
                 throw new SemanticException("Automated snapshot has not been turn on");
@@ -104,6 +115,28 @@ public class ClusterSnapshotAnalyzer {
             statement.setIntervalSeconds(intervalSeconds);
 
             return null;
+        }
+
+        private static void checkSystemOperate(ConnectContext context) {
+            try {
+                Authorizer.checkSystemAction(context, PrivilegeType.OPERATE);
+            } catch (AccessDeniedException e) {
+                AccessDeniedException.reportAccessDenied(
+                        InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME,
+                        context.getCurrentUserIdentity(), context.getCurrentRoleIds(),
+                        PrivilegeType.OPERATE.name(), ObjectType.SYSTEM.name(), null);
+            }
+        }
+
+        private static void checkStorageVolumeUsage(ConnectContext context, String storageVolumeName) {
+            try {
+                Authorizer.checkStorageVolumeAction(context, storageVolumeName, PrivilegeType.USAGE);
+            } catch (AccessDeniedException e) {
+                AccessDeniedException.reportAccessDenied(
+                        InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME,
+                        context.getCurrentUserIdentity(), context.getCurrentRoleIds(),
+                        PrivilegeType.USAGE.name(), ObjectType.STORAGE_VOLUME.name(), storageVolumeName);
+            }
         }
     }
 }
