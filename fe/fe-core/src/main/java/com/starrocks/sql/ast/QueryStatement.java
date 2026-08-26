@@ -21,6 +21,7 @@ import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.OutFileClause;
 import com.starrocks.analysis.RedirectStatus;
 import com.starrocks.analysis.SlotRef;
+import com.starrocks.analysis.Subquery;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Table;
@@ -28,6 +29,7 @@ import com.starrocks.common.Pair;
 import com.starrocks.qe.OriginStatement;
 import com.starrocks.thrift.TExprOpcode;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -100,6 +102,19 @@ public class QueryStatement extends StatementBase {
 
         if (!(selectRelation.getRelation() instanceof TableRelation)) {
             return false;
+        }
+
+        // The prepared point-query fast path only replans predicates for one direct table scan.
+        // A scalar subquery in the projection adds independent scans and policy state that cannot
+        // safely share that cached plan.
+        if (selectRelation.getOutputExpression() != null) {
+            for (Expr outputExpression : selectRelation.getOutputExpression()) {
+                List<Subquery> subqueries = new ArrayList<>();
+                outputExpression.collect(Subquery.class, subqueries);
+                if (!subqueries.isEmpty()) {
+                    return false;
+                }
+            }
         }
 
         if (((TableRelation) selectRelation.getRelation()).getTable().getType() != Table.TableType.OLAP) {

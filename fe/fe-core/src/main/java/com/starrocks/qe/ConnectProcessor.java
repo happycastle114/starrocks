@@ -195,6 +195,9 @@ public class ConnectProcessor {
         // reconstruct serializer
         ctx.getSerializer().reset();
         ctx.getSerializer().setCapability(ctx.getCapability());
+        // COM_RESET_CONNECTION and COM_CHANGE_USER start a new logical session. Prepared
+        // statements must not carry analyzed metadata, cached plans, or policy state across it.
+        ctx.clearPreparedStmts();
         // reset session variable
         ctx.resetSessionVariable();
     }
@@ -746,6 +749,7 @@ public class ConnectProcessor {
             // audit will affect performance
             boolean enableAudit = ctx.getSessionVariable().isAuditExecuteStmt();
             String originStmt = executeStmt.toSql();
+            PrepareStmt preparedExecutionStmt = null;
             executeStmt.setOrigStmt(new OriginStatement(originStmt, 0));
 
             boolean isQuery = ctx.isQueryStmt(executeStmt);
@@ -759,15 +763,19 @@ public class ConnectProcessor {
                 PrepareStmtContext prepareStmtContext = ctx.getPreparedStmt(executeStmt.getStmtName());
                 if (prepareStmtContext != null) {
                     if (prepareStmtContext.getStmt().getInnerStmt() instanceof QueryStatement) {
-                        PrepareStmt prepareStmt = prepareStmtContext.getStmt();
-                        StatementBase deparameterizedStmt = prepareStmt.assignValues(executeStmt.getParamsExpr());
-                        originStmt = AstToSQLBuilder.toSQL(deparameterizedStmt);
+                        if (prepareStmtContext.isCached()) {
+                            originStmt = prepareStmtContext.getBoundSqlForAudit(executeStmt.getParamsExpr());
+                        } else {
+                            preparedExecutionStmt = prepareStmtContext.instantiate(executeStmt.getParamsExpr());
+                            originStmt = AstToSQLBuilder.toSQL(preparedExecutionStmt.getInnerStmt());
+                        }
                         executeStmt.setOrigStmt(new OriginStatement(originStmt, 0));
                     }
                 }
             }
 
             executor = new StmtExecutor(ctx, executeStmt);
+            executor.setPreparedExecutionStmt(preparedExecutionStmt);
             ctx.setExecutor(executor);
             if (enableAudit) {
                 resetAuditEventBuilder();

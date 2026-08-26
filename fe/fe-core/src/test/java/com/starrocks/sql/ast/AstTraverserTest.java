@@ -87,4 +87,22 @@ public class AstTraverserTest {
         assertTablesReachedAndMarked(
                 "select 1 union all select 2 order by (select max(k1) from db1.tbl1)", 1);
     }
+
+    @Test
+    public void testPrepareMarksOnlyTheExecutableSelectBoundary() {
+        PrepareStmt prepareStmt = (PrepareStmt) parse(
+                "PREPARE p1 FROM 'select * from db1.tbl1 where k1 = ?'");
+
+        // PREPARE is metadata work, not execution. Generic statement traversal deliberately does
+        // not enter its inner statement, so callers cannot accidentally analyze and then reuse a
+        // policy-mutated AST as an executable plan.
+        Assertions.assertTrue(collectTableRelations(prepareStmt).isEmpty());
+        SecurityPolicyRewriteRule.markRelationsForRewrite(prepareStmt);
+        TableRelation innerRelation = collectTableRelations(prepareStmt.getInnerStmt()).get(0);
+        Assertions.assertFalse(innerRelation.isNeedRewrittenByPolicy());
+
+        // PREPARE metadata analysis and each EXECUTE explicitly mark the executable SELECT.
+        SecurityPolicyRewriteRule.markRelationsForRewrite(prepareStmt.getInnerStmt());
+        Assertions.assertTrue(innerRelation.isNeedRewrittenByPolicy());
+    }
 }

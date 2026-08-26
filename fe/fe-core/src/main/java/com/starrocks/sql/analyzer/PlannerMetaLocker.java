@@ -32,6 +32,7 @@ import com.starrocks.sql.ast.AlterViewStmt;
 import com.starrocks.sql.ast.AstTraverser;
 import com.starrocks.sql.ast.DeleteStmt;
 import com.starrocks.sql.ast.InsertStmt;
+import com.starrocks.sql.ast.PrepareStmt;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.TableRelation;
 import com.starrocks.sql.ast.UpdateStmt;
@@ -189,6 +190,13 @@ public class PlannerMetaLocker implements AutoCloseable {
             this.session = session;
             this.dbs = dbs;
             this.tables = tables;
+        }
+
+        @Override
+        public Void visitPrepareStatement(PrepareStmt node, Void context) {
+            // PREPARE is opaque to generic traversal because it is a deferred execution boundary.
+            // Metadata analysis still needs the same table locks as its inner query.
+            return visit(node.getInnerStmt(), context);
         }
 
         @Override

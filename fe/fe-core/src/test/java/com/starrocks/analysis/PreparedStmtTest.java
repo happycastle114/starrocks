@@ -15,23 +15,36 @@
 package com.starrocks.analysis;
 
 import com.starrocks.common.AnalysisException;
+import com.starrocks.common.jmockit.Deencapsulation;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.qe.OriginStatement;
 import com.starrocks.qe.PrepareStmtContext;
 import com.starrocks.qe.StmtExecutor;
+import com.starrocks.sql.analyzer.AstToSQLBuilder;
+import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.ast.ExecuteStmt;
 import com.starrocks.sql.ast.PrepareStmt;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.SelectRelation;
 import com.starrocks.sql.ast.StatementBase;
+import com.starrocks.sql.ast.TableRelation;
 import com.starrocks.sql.common.StarRocksPlannerException;
+import com.starrocks.sql.optimizer.LogicalPlanPrinter;
 import com.starrocks.sql.parser.SqlParser;
+import com.starrocks.sql.plan.ExecPlan;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 
 import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -129,6 +142,186 @@ public class PreparedStmtTest{
         Assertions.assertEquals(false, stmt.getParameters().get(0).equals(stmt.getParameters().get(1)));
         Assertions.assertEquals(false, stmt.getParameters().get(1).equals(stmt.getParameters().get(2)));
         Assertions.assertEquals(false, stmt.getParameters().get(0).equals(stmt.getParameters().get(2)));
+    }
+
+    @Test
+    public void testExecutionUsesPrepareNamespaceAndRestoresUseState() throws Exception {
+        String name = "prepare_namespace_stmt";
+        PrepareStmt metadataStmt = (PrepareStmt) SqlParser.parse(
+                "PREPARE " + name + " FROM 'select c0 from prepare_stmt where c0 = ?'",
+                ctx.getSessionVariable()).get(0);
+        PrepareStmtContext prepareContext = new PrepareStmtContext(metadataStmt, ctx, null);
+        String preparedDatabase = ctx.getDatabase();
+        boolean preparedAliasMode = ctx.isRelationAliasCaseInsensitive();
+        String callerDatabase = "database_selected_after_prepare";
+        boolean callerAliasMode = !preparedAliasMode;
+
+        ctx.setDatabase(callerDatabase);
+        ctx.setRelationAliasCaseInSensitive(callerAliasMode);
+        ctx.putPreparedStmt(name, prepareContext);
+        try {
+            PrepareStmt first = prepareContext.instantiate(List.of(new IntLiteral(11)));
+            PrepareStmt second = prepareContext.instantiate(List.of(new IntLiteral(22)));
+            Assertions.assertNotSame(metadataStmt.getInnerStmt(), first.getInnerStmt());
+            Assertions.assertNotSame(first.getInnerStmt(), second.getInnerStmt());
+            Assertions.assertNull(metadataStmt.getParameters().get(0).getExpr());
+
+            GeneratedPreparedPlan generated = generatePreparedPlan(name, new IntLiteral(33));
+            SelectRelation plannedSelect = (SelectRelation) ((QueryStatement) generated.executor.getParsedStmt())
+                    .getQueryRelation();
+            Assertions.assertEquals(preparedDatabase,
+                    ((TableRelation) plannedSelect.getRelation()).getName().getDb());
+            Assertions.assertEquals(callerDatabase, ctx.getDatabase(),
+                    "EXECUTE must restore the database selected after PREPARE");
+            Assertions.assertEquals(callerAliasMode, ctx.isRelationAliasCaseInsensitive(),
+                    "EXECUTE must restore parser-visible session state");
+        } finally {
+            ctx.removePreparedStmt(name);
+            ctx.setDatabase(preparedDatabase);
+            ctx.setRelationAliasCaseInSensitive(preparedAliasMode);
+        }
+    }
+
+    @Test
+    public void testExecutionReparseUsesPreparedSessionVariableSnapshot() {
+        boolean originalLargeIn = ctx.getSessionVariable().enableLargeInPredicate();
+        int originalThreshold = ctx.getSessionVariable().getLargeInPredicateThreshold();
+        try {
+            ctx.getSessionVariable().setEnableLargeInPredicate(true);
+            ctx.getSessionVariable().setLargeInPredicateThreshold(2);
+            String sql = "select c0 from prepare_stmt where c0 in ('a', 'b')";
+            StatementBase query = SqlParser.parse(sql, ctx.getSessionVariable()).get(0);
+            PrepareStmt metadataStmt = new PrepareStmt("parser_snapshot_stmt", query, List.of());
+            PrepareStmtContext prepareContext = new PrepareStmtContext(
+                    metadataStmt, ctx, null, new OriginStatement(sql, 0));
+
+            // Simulate SET changing parser behavior after PREPARE. EXECUTE reparses under the
+            // PREPARE-time snapshot and must restore the caller-visible value afterwards.
+            ctx.getSessionVariable().setEnableLargeInPredicate(false);
+            PrepareStmt executable = prepareContext.instantiate(List.of());
+            SelectRelation select = (SelectRelation) ((QueryStatement) executable.getInnerStmt()).getQueryRelation();
+
+            Assertions.assertInstanceOf(LargeInPredicate.class, select.getPredicate());
+            Assertions.assertFalse(ctx.getSessionVariable().enableLargeInPredicate());
+        } finally {
+            ctx.getSessionVariable().setEnableLargeInPredicate(originalLargeIn);
+            ctx.getSessionVariable().setLargeInPredicateThreshold(originalThreshold);
+        }
+    }
+
+    @Test
+    public void testPreparedExecutionReevaluatesChangedPolicy() throws Exception {
+        String name = "dynamic_policy_stmt";
+        AtomicReference<String> currentPolicy = new AtomicReference<>("prepare_policy");
+
+        try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class)) {
+            authorizer.when(() -> Authorizer.getColumnMaskingPolicy(
+                            Mockito.any(), Mockito.any(), Mockito.any()))
+                    .thenAnswer(invocation -> Map.of("c0", new StringLiteral(currentPolicy.get())));
+            authorizer.when(() -> Authorizer.getRowAccessPolicy(Mockito.any(), Mockito.any()))
+                    .thenReturn(null);
+
+            // PREPARE may rewrite its metadata copy, but every EXECUTE must start from pristine
+            // SQL and apply the policy that is active at that execution boundary.
+            PrepareStmt metadataStmt = (PrepareStmt) SqlParser.parse(
+                    "PREPARE " + name + " FROM 'select c0 from prepare_stmt where c0 = ?'",
+                    ctx.getSessionVariable()).get(0);
+            new StmtExecutor(ctx, metadataStmt).execute();
+            PrepareStmtContext prepareContext = ctx.getPreparedStmt(name);
+            Assertions.assertNotNull(prepareContext);
+            Assertions.assertTrue(AstToSQLBuilder.toSQL(metadataStmt.getInnerStmt()).contains("prepare_policy"));
+
+            currentPolicy.set("execute_policy_1");
+            GeneratedPreparedPlan firstPlan = generatePreparedPlan(name, new StringLiteral("first"));
+            String firstSql = AstToSQLBuilder.toSQL(firstPlan.executor.getParsedStmt());
+
+            currentPolicy.set("execute_policy_2");
+            GeneratedPreparedPlan secondPlan = generatePreparedPlan(name, new StringLiteral("second"));
+            String secondSql = AstToSQLBuilder.toSQL(secondPlan.executor.getParsedStmt());
+
+            Assertions.assertNotSame(firstPlan.executor.getParsedStmt(), secondPlan.executor.getParsedStmt());
+            Assertions.assertTrue(firstSql.contains("execute_policy_1"), firstSql);
+            Assertions.assertTrue(secondSql.contains("execute_policy_2"), secondSql);
+            Assertions.assertTrue(logicalPlan(firstPlan.execPlan).contains("execute_policy_1"));
+            Assertions.assertTrue(logicalPlan(secondPlan.execPlan).contains("execute_policy_2"));
+            Assertions.assertFalse(prepareContext.isCached());
+            Assertions.assertNull(metadataStmt.getParameters().get(0).getExpr());
+        } finally {
+            ctx.removePreparedStmt(name);
+        }
+    }
+
+    @Test
+    public void testCachedPreparedPlanIsInvalidatedWhenPolicyAppears() throws Exception {
+        String name = "policy_added_after_cache_stmt";
+        PrepareStmt metadataStmt = (PrepareStmt) SqlParser.parse(
+                "PREPARE " + name + " FROM 'select c0 from prepare_stmt where c0 = ?'",
+                ctx.getSessionVariable()).get(0);
+        PrepareStmtContext prepareContext = new PrepareStmtContext(metadataStmt, ctx, null);
+        ctx.putPreparedStmt(name, prepareContext);
+        AtomicBoolean policyEnabled = new AtomicBoolean(false);
+
+        try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class)) {
+            authorizer.when(() -> Authorizer.getColumnMaskingPolicy(
+                            Mockito.any(), Mockito.any(), Mockito.any()))
+                    .thenReturn(Map.of());
+            authorizer.when(() -> Authorizer.getRowAccessPolicy(Mockito.any(), Mockito.any()))
+                    .thenAnswer(invocation -> policyEnabled.get() ? new BoolLiteral(false) : null);
+
+            GeneratedPreparedPlan firstPlan = generatePreparedPlan(name, new StringLiteral("first"));
+            Assertions.assertTrue(prepareContext.isCached());
+
+            policyEnabled.set(true);
+            GeneratedPreparedPlan secondPlan = generatePreparedPlan(name, new StringLiteral("second"));
+            String secondSql = AstToSQLBuilder.toSQL(secondPlan.executor.getParsedStmt());
+
+            Assertions.assertNotSame(firstPlan.executor.getParsedStmt(), secondPlan.executor.getParsedStmt());
+            Assertions.assertTrue(secondSql.contains("WHERE FALSE"), secondSql);
+            Assertions.assertTrue(logicalPlan(secondPlan.execPlan).toLowerCase().contains("false"));
+            Assertions.assertFalse(prepareContext.isCached());
+        } finally {
+            ctx.removePreparedStmt(name);
+        }
+    }
+
+    @Test
+    public void testPreparedPointQueryWithScalarSubqueryIsNotCached() throws Exception {
+        String name = "nested_prepared_stmt";
+        PrepareStmt metadataStmt = (PrepareStmt) SqlParser.parse(
+                "PREPARE " + name + " FROM 'select (select max(c1) from prepare_stmt) "
+                        + "from prepare_stmt where c0 = ?'",
+                ctx.getSessionVariable()).get(0);
+        PrepareStmtContext prepareContext = new PrepareStmtContext(metadataStmt, ctx, null);
+        ctx.putPreparedStmt(name, prepareContext);
+        try {
+            generatePreparedPlan(name, new StringLiteral("first"));
+            Assertions.assertFalse(prepareContext.isCached(),
+                    "The point-query cache cannot safely replan scans inside a scalar subquery");
+        } finally {
+            ctx.removePreparedStmt(name);
+        }
+    }
+
+    private GeneratedPreparedPlan generatePreparedPlan(String name, Expr value) throws Exception {
+        ExecuteStmt executeStmt = new ExecuteStmt(name, List.of(value));
+        executeStmt.setOrigStmt(new OriginStatement("EXECUTE " + name, 0));
+        StmtExecutor executor = new StmtExecutor(ctx, executeStmt);
+        ExecPlan execPlan = Deencapsulation.invoke(executor, "generateExecPlan");
+        return new GeneratedPreparedPlan(executor, execPlan);
+    }
+
+    private static String logicalPlan(ExecPlan execPlan) {
+        return LogicalPlanPrinter.print(execPlan.getLogicalPlan().getRoot(), true, true);
+    }
+
+    private static class GeneratedPreparedPlan {
+        private final StmtExecutor executor;
+        private final ExecPlan execPlan;
+
+        private GeneratedPreparedPlan(StmtExecutor executor, ExecPlan execPlan) {
+            this.executor = executor;
+            this.execPlan = execPlan;
+        }
     }
 
     @Test
