@@ -154,6 +154,7 @@ import com.starrocks.sql.analyzer.AstToSQLBuilder;
 import com.starrocks.sql.analyzer.AstToStringBuilder;
 import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.analyzer.Field;
+import com.starrocks.sql.analyzer.PreAnalyzerAuthorization;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.analyzer.SetStmtAnalyzer;
 import com.starrocks.sql.ast.AddBackendBlackListStmt;
@@ -1214,6 +1215,7 @@ public class StmtExecutor {
 
     // support select hint e.g. select /*+ SET_VAR(query_timeout=1) */ sleep(3);
     public void processQueryScopeHint() throws DdlException {
+        PreAnalyzerAuthorization.checkRangerManagedQuery(parsedStmt, context);
         SessionVariable clonedSessionVariable = null;
         UUID queryId = context.getQueryId();
         final TUniqueId executionId = context.getExecutionId();

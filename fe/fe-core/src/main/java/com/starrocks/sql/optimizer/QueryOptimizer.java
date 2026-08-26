@@ -27,6 +27,7 @@ import com.starrocks.qe.SessionVariable;
 import com.starrocks.qe.feedback.OperatorTuningGuides;
 import com.starrocks.qe.feedback.PlanTuningAdvisor;
 import com.starrocks.sql.Explain;
+import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.base.PhysicalPropertySet;
@@ -335,7 +336,8 @@ public class QueryOptimizer extends Optimizer {
         SessionVariable sessionVariable = connectContext.getSessionVariable();
         // MV Rewrite will be used when cbo is enabled.
         if (context.getOptimizerOptions().isRuleBased() || sessionVariable.isDisableMaterializedViewRewrite() ||
-                !sessionVariable.isEnableMaterializedViewRewrite()) {
+                !sessionVariable.isEnableMaterializedViewRewrite() ||
+                !Authorizer.isPlannerRewriteAllowed(connectContext)) {
             return;
         }
         // prepare related mvs if needed and initialize mv rewrite strategy
@@ -653,6 +655,7 @@ public class QueryOptimizer extends Optimizer {
         // Add a config to decide whether to rewrite sync mv.
         if (!optimizerOptions.isRuleDisable(TF_MATERIALIZED_VIEW)
                 && sessionVariable.isEnableSyncMaterializedViewRewrite()
+                && Authorizer.isPlannerRewriteAllowed(context.getConnectContext())
                 && !context.getQueryMaterializationContext().hasRewrittenSuccess()) {
             // Split or predicates to union all so can be used by mv rewrite to choose the best sort key indexes.
             // TODO: support adaptive for or-predicates to union all.

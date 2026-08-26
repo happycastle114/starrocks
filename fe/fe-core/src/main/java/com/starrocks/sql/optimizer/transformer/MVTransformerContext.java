@@ -18,6 +18,7 @@ import com.starrocks.analysis.ParseNode;
 import com.starrocks.catalog.View;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.SessionVariable;
+import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.optimizer.operator.Operator;
 import com.starrocks.sql.util.Box;
 
@@ -44,7 +45,8 @@ public class MVTransformerContext {
         // set session variable
         SessionVariable sessionVariable = context.getSessionVariable();
         if (sessionVariable.isDisableMaterializedViewRewrite() ||
-                !sessionVariable.isEnableMaterializedViewRewrite()) {
+                !sessionVariable.isEnableMaterializedViewRewrite() ||
+                !Authorizer.isPlannerRewriteAllowed(context)) {
             this.isEnableTextBasedMVRewrite = false;
             this.isEnableViewBasedMVRewrite = false;
         } else {

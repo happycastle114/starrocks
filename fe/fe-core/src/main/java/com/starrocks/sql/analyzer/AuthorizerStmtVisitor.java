@@ -102,6 +102,7 @@ import com.starrocks.sql.ast.CreateDbStmt;
 import com.starrocks.sql.ast.CreateFileStmt;
 import com.starrocks.sql.ast.CreateFunctionStmt;
 import com.starrocks.sql.ast.CreateMaterializedViewStatement;
+import com.starrocks.sql.ast.CreateMaterializedViewStmt;
 import com.starrocks.sql.ast.CreateRepositoryStmt;
 import com.starrocks.sql.ast.CreateResourceGroupStmt;
 import com.starrocks.sql.ast.CreateResourceStmt;
@@ -2589,6 +2590,22 @@ public class AuthorizerStmtVisitor implements AstVisitor<Void, ConnectContext> {
 
     // ---------------------------------------- Materialized View stmt --------------------------------
     @Override
+    public Void visitCreateMaterializedViewStmt(CreateMaterializedViewStmt statement,
+                                                ConnectContext context) {
+        TableName tableName = statement.getTableName();
+        try {
+            Authorizer.checkDbAction(context, tableName.getCatalog(), tableName.getDb(),
+                    PrivilegeType.CREATE_MATERIALIZED_VIEW);
+        } catch (AccessDeniedException e) {
+            AccessDeniedException.reportAccessDenied(
+                    tableName.getCatalog(), context.getCurrentUserIdentity(), context.getCurrentRoleIds(),
+                    PrivilegeType.CREATE_MATERIALIZED_VIEW.name(), ObjectType.DATABASE.name(), tableName.getDb());
+        }
+        visitQueryStatement(statement.getQueryStatement(), context);
+        return null;
+    }
+
+    @Override
     public Void visitCreateMaterializedViewStatement(CreateMaterializedViewStatement statement,
                                                      ConnectContext context) {
         try {
@@ -2665,7 +2682,8 @@ public class AuthorizerStmtVisitor implements AstVisitor<Void, ConnectContext> {
 
     @Override
     public Void visitDropMaterializedViewStatement(DropMaterializedViewStmt statement, ConnectContext context) {
-        // To keep compatibility with old mv, drop mv will be checked in execution logic, and only new mv is checked
+        // The statement may target an async MV object or a legacy synchronous rollup.
+        // Resolve the target and check the corresponding privilege in execution logic.
         return null;
     }
 

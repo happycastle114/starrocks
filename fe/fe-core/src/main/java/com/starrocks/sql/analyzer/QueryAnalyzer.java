@@ -1343,6 +1343,7 @@ public class QueryAnalyzer {
             }
             Scope queryOutputScope;
             try {
+                Authorizer.checkRangerManagedStoredDefinitionBeforeAnalysis(node.getQueryStatement(), session);
                 queryOutputScope = process(node.getQueryStatement(), scope);
             } catch (CyclicViewException e) {
                 // Let the cycle error surface as-is; re-wrapping it at every enclosing view would

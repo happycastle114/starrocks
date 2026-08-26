@@ -16,9 +16,9 @@ package com.starrocks.authorization;
 
 import com.google.common.collect.ImmutableSet;
 import com.starrocks.analysis.DictQueryExpr;
+import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.FunctionCallExpr;
 import com.starrocks.analysis.HintNode;
-import com.starrocks.analysis.ParseNode;
 import com.starrocks.analysis.TableName;
 import com.starrocks.catalog.MaterializedView;
 import com.starrocks.catalog.View;
@@ -40,7 +40,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 
-final class RangerManagedViewSecurity {
+public final class RangerManagedViewSecurity {
     private static final Set<String> FORBIDDEN_FUNCTIONS = ImmutableSet.of(
             "FILES",
             "DICTIONARY_GET",
@@ -59,6 +59,9 @@ final class RangerManagedViewSecurity {
             "_META_", "_BINLOG_", "_SYNC_MV_", "_USE_PK_INDEX_", "_CACHE_STATS_");
     private static final Set<String> FORBIDDEN_SCHEMAS = ImmutableSet.of(
             "INFORMATION_SCHEMA", "SYS", "_STATISTICS_");
+    private static final Set<String> ALLOWED_MANAGED_METADATA_RELATIONS = ImmutableSet.of(
+            "DEFAULT_CATALOG.INFORMATION_SCHEMA.COLUMNS",
+            "DEFAULT_CATALOG.INFORMATION_SCHEMA.TABLES");
     private static final Set<String> FORBIDDEN_CONNECTOR_METADATA_SUFFIXES = ImmutableSet.of(
             "LOGICAL_ICEBERG_METADATA",
             "REFS",
@@ -69,15 +72,65 @@ final class RangerManagedViewSecurity {
             "FILES",
             "PARTITIONS");
     private static final String VIEW_AUTHORIZATION_PATH_PREFIX = "ranger-authorization:";
+    private static final String DIRECT_QUERY_SCOPE = " in Ranger-managed query: ";
+    private static final String STORED_DEFINITION_SCOPE = " in Ranger-managed stored definition: ";
+    private static final String MATERIALIZED_VIEW_SCOPE = " in Ranger-managed materialized view: ";
+
+    private enum ValidationScope {
+        DIRECT_QUERY(DIRECT_QUERY_SCOPE),
+        STORED_DEFINITION(STORED_DEFINITION_SCOPE);
+
+        private final String denialScope;
+
+        ValidationScope(String denialScope) {
+            this.denialScope = denialScope;
+        }
+
+        private boolean allowsManagedMetadataRelations() {
+            return this == DIRECT_QUERY;
+        }
+    }
 
     private RangerManagedViewSecurity() {
     }
 
     static void check(ConnectContext context, QueryStatement statement) {
-        if (!Authorizer.isRangerManagedContext(context)) {
+        if (!shouldCheck(context)) {
             return;
         }
         new StoredViewVisitor(context).visit(statement);
+    }
+
+    public static void checkDirectQuery(ConnectContext context, QueryStatement statement) {
+        if (!shouldCheck(context)) {
+            return;
+        }
+        new ForbiddenDefinitionVisitor(ValidationScope.DIRECT_QUERY, context).visit(statement);
+    }
+
+    public static void checkDirectExpression(ConnectContext context, Expr expression) {
+        if (!shouldCheck(context)) {
+            return;
+        }
+        new ForbiddenDefinitionVisitor(ValidationScope.DIRECT_QUERY, context).visit(expression);
+    }
+
+    public static void checkDirectFileTableFunctionTarget(ConnectContext context) {
+        if (!shouldCheck(context)) {
+            return;
+        }
+        denyFunction(FileTableFunctionRelation.IDENTIFIER, DIRECT_QUERY_SCOPE);
+    }
+
+    public static void checkStoredDefinitionBeforeAnalysis(ConnectContext context, QueryStatement statement) {
+        if (!shouldCheck(context)) {
+            return;
+        }
+        new ForbiddenDefinitionVisitor(ValidationScope.STORED_DEFINITION, context).visit(statement);
+    }
+
+    private static boolean shouldCheck(ConnectContext context) {
+        return context != null && !context.isBypassAuthorizerCheck() && Authorizer.isRangerManagedContext(context);
     }
 
     static boolean isForbiddenTableHint(String hint) {
@@ -105,14 +158,14 @@ final class RangerManagedViewSecurity {
                 FORBIDDEN_FUNCTION_PREFIXES.stream().anyMatch(normalized::startsWith);
     }
 
-    private static void denyFunction(String function) {
-        deny(PrivilegeType.USAGE, ObjectType.FUNCTION, function.toUpperCase(Locale.ROOT));
+    private static void denyFunction(String function, String scope) {
+        deny(PrivilegeType.USAGE, ObjectType.FUNCTION, function.toUpperCase(Locale.ROOT), scope);
     }
 
-    private static void deny(PrivilegeType privilege, ObjectType objectType, String object) {
+    private static void deny(PrivilegeType privilege, ObjectType objectType, String object, String scope) {
         throw ErrorReportException.report(
                 ErrorCode.ERR_ACCESS_DENIED_FOR_EXTERNAL_ACCESS_CONTROLLER,
-                privilege.name(), objectType.name(), " in Ranger-managed stored definition: " + object);
+                privilege.name(), objectType.name(), scope + object);
     }
 
     private static String authorizationPathKey(ViewRelation relation) {
@@ -123,10 +176,6 @@ final class RangerManagedViewSecurity {
         TableName name = relation.getName();
         return VIEW_AUTHORIZATION_PATH_PREFIX + "view:name:" +
                 (name == null ? view.getName() : name.toString());
-    }
-
-    private static String authorizationPathKey(MaterializedView materializedView) {
-        return VIEW_AUTHORIZATION_PATH_PREFIX + "materialized-view:id:" + materializedView.getId();
     }
 
     private static final class StoredViewVisitor extends AstTraverser<Void, Void> {
@@ -149,14 +198,8 @@ final class RangerManagedViewSecurity {
                 return null;
             }
 
-            ParseNode parseNode = materializedView.getDefineQueryParseNode();
-            if (!(parseNode instanceof QueryStatement definition)) {
-                deny(PrivilegeType.SELECT, ObjectType.MATERIALIZED_VIEW,
-                        relation.getName() + " (definition unavailable)");
-                return null;
-            }
-            authorizeStoredQuery(
-                    authorizationPathKey(materializedView), String.valueOf(relation.getName()), definition);
+            deny(PrivilegeType.SELECT, ObjectType.MATERIALIZED_VIEW,
+                    String.valueOf(relation.getName()), MATERIALIZED_VIEW_SCOPE);
             return null;
         }
 
@@ -167,7 +210,7 @@ final class RangerManagedViewSecurity {
                         "Stored relation " + objectName + " contains a cycle in its definition");
             }
             try {
-                new ForbiddenDefinitionVisitor().visit(definition);
+                new ForbiddenDefinitionVisitor(ValidationScope.STORED_DEFINITION, context).visit(definition);
                 Authorizer.check(definition, context);
             } finally {
                 path.remove(pathKey);
@@ -176,9 +219,20 @@ final class RangerManagedViewSecurity {
     }
 
     private static final class ForbiddenDefinitionVisitor extends AstTraverser<Void, Void> {
+        private final ValidationScope scope;
+        private final ConnectContext connectContext;
+
+        private ForbiddenDefinitionVisitor(ValidationScope scope, ConnectContext connectContext) {
+            this.scope = scope;
+            this.connectContext = connectContext;
+        }
+
         @Override
         public Void visitQueryStatement(QueryStatement statement, Void context) {
             rejectHints(statement.getAllQueryScopeHints());
+            if (statement.hasOutFileClause()) {
+                deny(PrivilegeType.SELECT, ObjectType.SYSTEM, "OUTFILE", scope.denialScope);
+            }
             return super.visitQueryStatement(statement, context);
         }
 
@@ -199,17 +253,23 @@ final class RangerManagedViewSecurity {
         public Void visitTable(TableRelation relation, Void context) {
             TableName name = relation.getName();
             if (name != null) {
-                String schema = name.getDb() == null ? null : name.getDb().toUpperCase(Locale.ROOT);
-                if (schema != null && FORBIDDEN_SCHEMAS.contains(schema)) {
-                    deny(PrivilegeType.SELECT, ObjectType.DATABASE, schema);
+                String schema = name.getDb();
+                if ((schema == null || schema.isEmpty()) && scope == ValidationScope.DIRECT_QUERY) {
+                    schema = connectContext.getDatabase();
+                }
+                schema = schema == null ? null : schema.toUpperCase(Locale.ROOT);
+                String relationName = canonicalRelationName(name, schema);
+                if (schema != null && FORBIDDEN_SCHEMAS.contains(schema) &&
+                        !isAllowedManagedMetadataRelation(name, relationName)) {
+                    deny(PrivilegeType.SELECT, ObjectType.DATABASE, schema, scope.denialScope);
                 }
                 if (isForbiddenConnectorMetadataTable(name.getTbl())) {
-                    deny(PrivilegeType.SELECT, ObjectType.TABLE, name.getTbl());
+                    deny(PrivilegeType.SELECT, ObjectType.TABLE, name.getTbl(), scope.denialScope);
                 }
             }
             for (TableRelation.TableHint hint : relation.getTableHints()) {
                 if (isForbiddenTableHint(hint.name())) {
-                    deny(PrivilegeType.SELECT, ObjectType.TABLE, hint.name());
+                    deny(PrivilegeType.SELECT, ObjectType.TABLE, hint.name(), scope.denialScope);
                 }
             }
             return super.visitTable(relation, context);
@@ -219,20 +279,20 @@ final class RangerManagedViewSecurity {
         public Void visitFunctionCall(FunctionCallExpr function, Void context) {
             String functionName = function.getFnName().getFunction();
             if (isForbiddenFunction(functionName)) {
-                denyFunction(functionName);
+                denyFunction(functionName, scope.denialScope);
             }
             return visitExpression(function, context);
         }
 
         @Override
         public Void visitDictQueryExpr(DictQueryExpr function, Void context) {
-            denyFunction("DICT_MAPPING");
+            denyFunction("DICT_MAPPING", scope.denialScope);
             return null;
         }
 
         @Override
         public Void visitDictionaryGetExpr(DictionaryGetExpr function, Void context) {
-            denyFunction("DICTIONARY_GET");
+            denyFunction("DICTIONARY_GET", scope.denialScope);
             return null;
         }
 
@@ -240,21 +300,38 @@ final class RangerManagedViewSecurity {
         public Void visitTableFunction(TableFunctionRelation function, Void context) {
             String functionName = function.getFunctionName().getFunction();
             if (isForbiddenFunction(functionName)) {
-                denyFunction(functionName);
+                denyFunction(functionName, scope.denialScope);
             }
             return super.visitTableFunction(function, context);
         }
 
         @Override
         public Void visitFileTableFunction(FileTableFunctionRelation function, Void context) {
-            denyFunction(FileTableFunctionRelation.IDENTIFIER);
+            denyFunction(FileTableFunctionRelation.IDENTIFIER, scope.denialScope);
             return null;
         }
 
-        private static void rejectHints(List<HintNode> hints) {
+        private void rejectHints(List<HintNode> hints) {
             if (hints != null && !hints.isEmpty()) {
-                deny(PrivilegeType.SELECT, ObjectType.SYSTEM, hints.get(0).toSql());
+                deny(PrivilegeType.SELECT, ObjectType.SYSTEM, hints.get(0).toSql(), scope.denialScope);
             }
+        }
+
+        private boolean isAllowedManagedMetadataRelation(TableName name, String relationName) {
+            return scope.allowsManagedMetadataRelations() &&
+                    ALLOWED_MANAGED_METADATA_RELATIONS.contains(relationName);
+        }
+
+        private String canonicalRelationName(TableName name, String schema) {
+            String catalog = name.getCatalog();
+            if (catalog == null || catalog.isEmpty()) {
+                catalog = connectContext.getCurrentCatalog();
+            }
+            if (catalog == null || schema == null || name.getTbl() == null) {
+                return null;
+            }
+            return catalog.toUpperCase(Locale.ROOT) + "." + schema + "." +
+                    name.getTbl().toUpperCase(Locale.ROOT);
         }
     }
 }

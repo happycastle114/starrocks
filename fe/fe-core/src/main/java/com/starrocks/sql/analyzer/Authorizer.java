@@ -24,6 +24,7 @@ import com.starrocks.authorization.AccessDeniedException;
 import com.starrocks.authorization.ObjectType;
 import com.starrocks.authorization.PEntryObject;
 import com.starrocks.authorization.PrivilegeType;
+import com.starrocks.authorization.RangerManagedViewSecurity;
 import com.starrocks.catalog.BasicTable;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
@@ -35,6 +36,7 @@ import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.CatalogMgr;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.server.WarehouseManager;
+import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.sql.ast.pipe.PipeName;
@@ -60,10 +62,31 @@ public class Authorizer {
         return getInstance().isRangerManagedContext(context);
     }
 
+    public static boolean isPlannerRewriteAllowed(ConnectContext context) {
+        return context.isBypassAuthorizerCheck() || !isRangerManagedContext(context);
+    }
+
     public static void check(StatementBase statement, ConnectContext context) {
         AccessControlProvider accessControlProvider = getInstance();
         accessControlProvider.validateAccessControlContext(context);
         accessControlProvider.getPrivilegeCheckerVisitor().check(statement, context);
+    }
+
+    public static void checkRangerManagedQueryBeforeAnalysis(QueryStatement statement, ConnectContext context) {
+        RangerManagedViewSecurity.checkDirectQuery(context, statement);
+    }
+
+    public static void checkRangerManagedExpressionBeforeAnalysis(Expr expression, ConnectContext context) {
+        RangerManagedViewSecurity.checkDirectExpression(context, expression);
+    }
+
+    public static void checkRangerManagedFileTableFunctionTargetBeforeAnalysis(ConnectContext context) {
+        RangerManagedViewSecurity.checkDirectFileTableFunctionTarget(context);
+    }
+
+    public static void checkRangerManagedStoredDefinitionBeforeAnalysis(
+            QueryStatement statement, ConnectContext context) {
+        RangerManagedViewSecurity.checkStoredDefinitionBeforeAnalysis(context, statement);
     }
 
     public static void checkSystemAction(ConnectContext context, PrivilegeType privilegeType)
@@ -135,6 +158,14 @@ public class Authorizer {
         }
         String catalog = tableName.getCatalog();
         getInstance().getAccessControlOrDefault(catalog, context)
+                .checkTableAction(context, tableName, privilegeType);
+    }
+
+    public static void checkTableActionByName(ConnectContext context, TableName tableName,
+                                              PrivilegeType privilegeType) throws AccessDeniedException {
+        AccessControlProvider accessControlProvider = getInstance();
+        accessControlProvider.validateAccessControlContext(context);
+        accessControlProvider.getAccessControlOrDefault(tableName.getCatalog(), context)
                 .checkTableAction(context, tableName, privilegeType);
     }
 

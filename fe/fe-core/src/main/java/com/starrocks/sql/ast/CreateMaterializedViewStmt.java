@@ -179,6 +179,10 @@ public class CreateMaterializedViewStmt extends DdlStmt {
         return mvTableName.getTbl();
     }
 
+    public TableName getTableName() {
+        return mvTableName;
+    }
+
     public List<MVColumnItem> getMVColumnItemList() {
         return mvColumnItemList;
     }

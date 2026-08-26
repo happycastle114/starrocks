@@ -58,6 +58,7 @@ import com.starrocks.lake.LakeMaterializedView;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.SessionVariable;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.ast.PartitionNames;
 import com.starrocks.sql.common.MetaUtils;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
@@ -383,6 +384,7 @@ public class MvRewritePreprocessor {
                                                       boolean isRuleBased) {
         if (Config.enable_experimental_mv
                 && connectContext.getSessionVariable().isEnableMaterializedViewRewrite()
+                && Authorizer.isPlannerRewriteAllowed(connectContext)
                 && !isRuleBased) {
             // related asynchronous materialized views
             Set<MaterializedViewWrapper> relatedMVs = getRelatedAsyncMVs(queryTables);

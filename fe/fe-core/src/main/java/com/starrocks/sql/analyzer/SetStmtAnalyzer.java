@@ -597,6 +597,8 @@ public class SetStmtAnalyzer {
     }
 
     public static void calcuteUserVariable(UserVariable userVariable) {
+        PreAnalyzerAuthorization.authorizeUserVariableBeforeCalculation(
+                userVariable, ConnectContext.get());
         Expr expression = userVariable.getUnevaluatedExpression();
         if (expression instanceof NullLiteral) {
             userVariable.setEvaluatedExpression(NullLiteral.create(Type.STRING));

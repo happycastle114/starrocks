@@ -46,6 +46,7 @@ import com.starrocks.sql.analyzer.AnalyzerUtils;
 import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.analyzer.InsertAnalyzer;
 import com.starrocks.sql.analyzer.PlannerMetaLocker;
+import com.starrocks.sql.analyzer.PreAnalyzerAuthorization;
 import com.starrocks.sql.analyzer.QueryAnalyzer;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.DeleteStmt;
@@ -110,6 +111,11 @@ public class StatementPlanner {
 
     public static ExecPlan plan(StatementBase stmt, ConnectContext session,
                                 TResultSinkType resultSinkType) {
+        PreAnalyzerAuthorization.Result preAnalysisAuthorization;
+        try (var guard = session.bindScope()) {
+            preAnalysisAuthorization = PreAnalyzerAuthorization.authorizeBefore(stmt, session);
+        }
+
         if (stmt instanceof QueryStatement) {
             OptimizerTraceUtil.logQueryStatement("after parse:\n%s", (QueryStatement) stmt);
         } else if (stmt instanceof DmlStmt) {
@@ -122,7 +128,9 @@ public class StatementPlanner {
         }
 
         SPMPlanner spmPlanner = new SPMPlanner(session);
-        stmt = spmPlanner.plan(stmt);
+        if (Authorizer.isPlannerRewriteAllowed(session)) {
+            stmt = spmPlanner.plan(stmt);
+        }
 
         boolean needWholePhaseLock = true;
         // 1. For all queries, we need db lock when analyze phase
@@ -133,7 +141,7 @@ public class StatementPlanner {
 
             // Authorization check
             if (!session.isBypassAuthorizerCheck()) {
-                Authorizer.check(stmt, session);
+                PreAnalyzerAuthorization.authorizeAfter(stmt, session, preAnalysisAuthorization);
             }
             if (stmt instanceof QueryStatement) {
                 OptimizerTraceUtil.logQueryStatement("after analyze:\n%s", (QueryStatement) stmt);
@@ -515,7 +523,8 @@ public class StatementPlanner {
         resultSink.setOutfileInfo(queryStmt.getOutFileClause(), columnOutputNames);
     }
 
-    private static void beginTransaction(DmlStmt stmt, ConnectContext session)
+    @VisibleForTesting
+    protected static void beginTransaction(DmlStmt stmt, ConnectContext session)
             throws BeginTransactionException, RunningTxnExceedException, AnalysisException, LabelAlreadyUsedException,
             DuplicatedRequestException {
         if (session.getTxnId() != 0) {

@@ -52,8 +52,12 @@ public class PrepareAnalyzer {
             // Analyzing when preparing is only used to return the correct resultset meta, but not to generate an
             // execution plan. This metadata working copy is intentionally separate from the pristine SQL template
             // used by EXECUTE.
+            PreAnalyzerAuthorization.checkRangerManagedQuery(innerStmt, session);
             SecurityPolicyRewriteRule.markRelationsForRewrite(innerStmt);
             Analyzer.analyze(innerStmt, ConnectContext.get());
+            if (!session.isBypassAuthorizerCheck()) {
+                Authorizer.check(innerStmt, session);
+            }
         }
     }
 

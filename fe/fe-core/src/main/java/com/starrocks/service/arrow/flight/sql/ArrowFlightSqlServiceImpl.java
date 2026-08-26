@@ -26,6 +26,7 @@ import com.starrocks.analysis.Expr;
 import com.starrocks.authorization.SecurityPolicyRewriteRule;
 import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
+import com.starrocks.common.ErrorReportException;
 import com.starrocks.common.InvalidConfException;
 import com.starrocks.common.Pair;
 import com.starrocks.common.ThreadPoolManager;
@@ -35,6 +36,8 @@ import com.starrocks.qe.OriginStatement;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.service.arrow.flight.sql.session.ArrowFlightSqlSessionManager;
 import com.starrocks.sql.analyzer.Analyzer;
+import com.starrocks.sql.analyzer.Authorizer;
+import com.starrocks.sql.analyzer.PreAnalyzerAuthorization;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.plan.ExecPlan;
@@ -199,22 +202,27 @@ public class ArrowFlightSqlServiceImpl implements FlightSqlProducer, AutoCloseab
 
                 ArrowFlightSqlConnectContext ctx = sessionManager.validateAndGetConnectContext(token);
 
-                String preparedStmtId = ctx.addPreparedStatement(request.getQuery());
-
                 // Try to plan the query to get the real schema for the prepared statement.
                 // This is important because clients (JDBC, ADBC) use the schema returned here
                 // to determine column names and types. Without this, a placeholder schema with
                 // a single column named "r" would be returned, which is incorrect.
                 Schema schema = buildSchemaFromQuery(ctx, request.getQuery());
+                ByteString datasetSchema = ByteString.copyFrom(serializeMetadata(schema));
+                ByteString parameterSchema = ByteString.copyFrom(
+                        serializeMetadata(new Schema(Collections.emptyList())));
+                String preparedStmtId = ctx.addPreparedStatement(request.getQuery());
 
                 FlightSql.ActionCreatePreparedStatementResult result =
                         FlightSql.ActionCreatePreparedStatementResult.newBuilder()
                                 .setPreparedStatementHandle(ByteString.copyFromUtf8(preparedStmtId))
-                                .setDatasetSchema(ByteString.copyFrom(serializeMetadata(schema)))
-                                .setParameterSchema(ByteString.copyFrom(serializeMetadata(new Schema(Collections.emptyList()))))
+                                .setDatasetSchema(datasetSchema)
+                                .setParameterSchema(parameterSchema)
                                 .build();
                 listener.onNext(new Result(Any.pack(result).toByteArray()));
                 listener.onCompleted();
+            } catch (ErrorReportException e) {
+                listener.onError(
+                        CallStatus.UNAUTHORIZED.withDescription(e.getMessage()).withCause(e).toRuntimeException());
             } catch (Exception e) {
                 listener.onError(
                         CallStatus.INTERNAL.withDescription("createPreparedStatement error: " + e.getMessage()).withCause(e)
@@ -929,9 +937,13 @@ public class ArrowFlightSqlServiceImpl implements FlightSqlProducer, AutoCloseab
                     return buildPlaceholderSchema();
                 }
                 stmt.setOrigStmt(new OriginStatement(query));
+                PreAnalyzerAuthorization.checkRangerManagedQuery(stmt, ctx);
                 SecurityPolicyRewriteRule.markRelationsForRewrite(stmt);
 
                 Analyzer.analyze(stmt, ctx);
+                if (!ctx.isBypassAuthorizerCheck()) {
+                    Authorizer.check(stmt, ctx);
+                }
 
                 QueryStatement queryStmt = (QueryStatement) stmt;
                 List<String> colNames = queryStmt.getQueryRelation().getColumnOutputNames();
@@ -946,6 +958,8 @@ public class ArrowFlightSqlServiceImpl implements FlightSqlProducer, AutoCloseab
                 }
                 return new Schema(arrowFields);
             }
+        } catch (ErrorReportException e) {
+            throw e;
         } catch (Exception e) {
             LOG.warn("[ARROW] Failed to analyze query for schema in createPreparedStatement, " +
                     "falling back to placeholder schema. query={}", query, e);

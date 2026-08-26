@@ -20,6 +20,8 @@ import com.google.protobuf.ByteString;
 import com.starrocks.analysis.ParseNode;
 import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
+import com.starrocks.common.ErrorCode;
+import com.starrocks.common.ErrorReportException;
 import com.starrocks.metric.LongCounterMetric;
 import com.starrocks.metric.MetricRepo;
 import com.starrocks.plugin.AuditEvent;
@@ -29,12 +31,17 @@ import com.starrocks.qe.OriginStatement;
 import com.starrocks.qe.QueryState;
 import com.starrocks.qe.SessionVariable;
 import com.starrocks.service.arrow.flight.sql.session.ArrowFlightSqlSessionManager;
+import com.starrocks.sql.analyzer.Analyzer;
+import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.common.AuditEncryptionChecker;
 import com.starrocks.thrift.TUniqueId;
 import mockit.Expectations;
+import mockit.Mock;
+import mockit.MockUp;
 import mockit.Mocked;
 import org.apache.arrow.flight.CallHeaders;
+import org.apache.arrow.flight.CallStatus;
 import org.apache.arrow.flight.CloseSessionRequest;
 import org.apache.arrow.flight.CloseSessionResult;
 import org.apache.arrow.flight.Criteria;
@@ -65,16 +72,19 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.channels.Channels;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -562,6 +572,13 @@ public class ArrowFlightSqlServiceImplTest {
         when(request.getQuery()).thenReturn(query);
         ArrowFlightSqlConnectContext realContext = new ArrowFlightSqlConnectContext("token123");
         when(sessionManager.validateAndGetConnectContext("token123")).thenReturn(realContext);
+        AtomicInteger authorizationCalls = new AtomicInteger();
+        new MockUp<Authorizer>() {
+            @Mock
+            public void check(StatementBase statement, ConnectContext context) {
+                authorizationCalls.incrementAndGet();
+            }
+        };
 
         CapturingResultListener listener = new CapturingResultListener();
         service.createPreparedStatement(request, mockCallContext, listener);
@@ -581,6 +598,68 @@ public class ArrowFlightSqlServiceImplTest {
 
         Schema parameterSchema = deserializeSchema(preparedStatementResult.getParameterSchema());
         assertTrue(parameterSchema.getFields().isEmpty());
+        assertEquals(1, authorizationCalls.get());
+    }
+
+    @Test
+    public void testCreatePreparedStatementRejectsManagedExternalIoWithoutHandle() throws Exception {
+        ArrowFlightSqlConnectContext realContext = new ArrowFlightSqlConnectContext("token123");
+        when(sessionManager.validateAndGetConnectContext("token123")).thenReturn(realContext);
+        Map<String, String> queries = new HashMap<>();
+        queries.put("SELECT * FROM FILES('path' = 'file:///__managed_flight_missing__')", "FILES");
+        queries.put("SELECT 1 INTO OUTFILE 'file:///__managed_flight_outfile__' FORMAT AS CSV", "OUTFILE");
+        AtomicInteger analyzerCalls = mockAnalyzer();
+        new MockUp<Authorizer>() {
+            @Mock
+            public boolean isRangerManagedContext(ConnectContext context) {
+                return true;
+            }
+        };
+
+        for (Map.Entry<String, String> query : queries.entrySet()) {
+            FlightSql.ActionCreatePreparedStatementRequest request =
+                    mock(FlightSql.ActionCreatePreparedStatementRequest.class);
+            when(request.getQuery()).thenReturn(query.getKey());
+            CapturingResultListener listener = new CapturingResultListener();
+
+            service.createPreparedStatement(request, mockCallContext, listener);
+
+            assertUnauthorizedWithoutPreparedHandle(listener, realContext, query.getValue());
+        }
+        assertEquals(0, analyzerCalls.get());
+    }
+
+    @Test
+    public void testCreatePreparedStatementRejectsDeniedTableAndViewWithoutHandle() throws Exception {
+        ArrowFlightSqlConnectContext realContext = new ArrowFlightSqlConnectContext("token123");
+        when(sessionManager.validateAndGetConnectContext("token123")).thenReturn(realContext);
+        AtomicInteger analyzerCalls = mockSuccessfulAnalyzer();
+        new MockUp<Authorizer>() {
+            @Mock
+            public boolean isRangerManagedContext(ConnectContext context) {
+                return false;
+            }
+
+            @Mock
+            public void check(StatementBase statement, ConnectContext context) {
+                throw ErrorReportException.report(
+                        ErrorCode.ERR_ACCESS_DENIED, "SELECT", "TABLE", " private_relation", "NONE", "NONE");
+            }
+        };
+
+        for (String query : new String[] {
+                "SELECT secret FROM private_table",
+                "SELECT secret FROM private_view"}) {
+            FlightSql.ActionCreatePreparedStatementRequest request =
+                    mock(FlightSql.ActionCreatePreparedStatementRequest.class);
+            when(request.getQuery()).thenReturn(query);
+            CapturingResultListener listener = new CapturingResultListener();
+
+            service.createPreparedStatement(request, mockCallContext, listener);
+
+            assertUnauthorizedWithoutPreparedHandle(listener, realContext, "SELECT");
+        }
+        assertEquals(2, analyzerCalls.get());
     }
 
     @Test
@@ -625,6 +704,48 @@ public class ArrowFlightSqlServiceImplTest {
             assertSame(previous, ConnectContext.get());
         } finally {
             ConnectContext.remove();
+        }
+    }
+
+    @Test
+    public void testBuildSchemaRejectsManagedExternalIoBeforeAnalyzer() throws Exception {
+        ArrowFlightSqlConnectContext context = new ArrowFlightSqlConnectContext("managed-token");
+        Method method = ArrowFlightSqlServiceImpl.class
+                .getDeclaredMethod("buildSchemaFromQuery", ArrowFlightSqlConnectContext.class, String.class);
+        method.setAccessible(true);
+        AtomicInteger analyzerCalls = mockAnalyzer();
+
+        try (MockedStatic<Authorizer> authorizer =
+                     mockStatic(Authorizer.class, Mockito.CALLS_REAL_METHODS)) {
+            authorizer.when(() -> Authorizer.isRangerManagedContext(context)).thenReturn(true);
+
+            InvocationTargetException filesException = assertThrows(InvocationTargetException.class,
+                    () -> method.invoke(service,
+                            context, "SELECT * FROM FILES('path' = 'file:///__managed_flight_missing__')"));
+            InvocationTargetException outfileException = assertThrows(InvocationTargetException.class,
+                    () -> method.invoke(service,
+                            context, "SELECT 1 INTO OUTFILE 'file:///__managed_flight_outfile__' FORMAT AS CSV"));
+            assertTrue(filesException.getCause() instanceof ErrorReportException);
+            assertTrue(outfileException.getCause() instanceof ErrorReportException);
+            assertEquals(0, analyzerCalls.get());
+        }
+    }
+
+    @Test
+    public void testBuildSchemaKeepsOrdinaryAnalyzerPath() throws Exception {
+        ArrowFlightSqlConnectContext context = new ArrowFlightSqlConnectContext("ordinary-token");
+        Method method = ArrowFlightSqlServiceImpl.class
+                .getDeclaredMethod("buildSchemaFromQuery", ArrowFlightSqlConnectContext.class, String.class);
+        method.setAccessible(true);
+        AtomicInteger analyzerCalls = mockAnalyzer();
+
+        try (MockedStatic<Authorizer> authorizer =
+                     mockStatic(Authorizer.class, Mockito.CALLS_REAL_METHODS)) {
+            authorizer.when(() -> Authorizer.isRangerManagedContext(context)).thenReturn(false);
+
+            Schema schema = (Schema) method.invoke(service, context, "SELECT 1");
+            assertEquals("result", schema.getFields().get(0).getName());
+            assertEquals(1, analyzerCalls.get());
         }
     }
 
@@ -679,6 +800,51 @@ public class ArrowFlightSqlServiceImplTest {
         Field field = target.getClass().getDeclaredField(fieldName);
         field.setAccessible(true);
         field.set(target, value);
+    }
+
+    private static AtomicInteger mockAnalyzer() {
+        AtomicInteger calls = new AtomicInteger();
+        new MockUp<Analyzer>() {
+            @Mock
+            public void analyze(StatementBase statement, ConnectContext context) {
+                calls.incrementAndGet();
+                throw new StopAnalysisException();
+            }
+        };
+        return calls;
+    }
+
+    private static AtomicInteger mockSuccessfulAnalyzer() {
+        AtomicInteger calls = new AtomicInteger();
+        new MockUp<Analyzer>() {
+            @Mock
+            public void analyze(StatementBase statement, ConnectContext context) {
+                calls.incrementAndGet();
+            }
+        };
+        return calls;
+    }
+
+    private static void assertUnauthorizedWithoutPreparedHandle(
+            CapturingResultListener listener, ArrowFlightSqlConnectContext context, String expectedMessage)
+            throws Exception {
+        assertTrue(listener.await(), "Timed out waiting for createPreparedStatement denial");
+        assertNull(listener.result);
+        assertTrue(listener.error instanceof FlightRuntimeException, String.valueOf(listener.error));
+        FlightRuntimeException error = (FlightRuntimeException) listener.error;
+        assertEquals(CallStatus.UNAUTHORIZED.code(), error.status().code());
+        assertTrue(error.getMessage().contains(expectedMessage), error.getMessage());
+        assertEquals(0, preparedStatementCount(context));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static int preparedStatementCount(ArrowFlightSqlConnectContext context) throws Exception {
+        Field field = ArrowFlightSqlConnectContext.class.getDeclaredField("preparedStatements");
+        field.setAccessible(true);
+        return ((Map<String, String>) field.get(context)).size();
+    }
+
+    private static class StopAnalysisException extends RuntimeException {
     }
 
     private FlightSql.ActionCreatePreparedStatementResult awaitPreparedStatementResult(CapturingResultListener listener)

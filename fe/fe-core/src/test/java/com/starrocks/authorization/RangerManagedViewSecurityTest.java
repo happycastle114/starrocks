@@ -60,52 +60,40 @@ public class RangerManagedViewSecurityTest {
     }
 
     @Test
-    public void testMaterializedViewBaseAuthorizationAndDefinitionGuard() {
+    public void testManagedMaterializedViewsAlwaysFailClosed() {
         ConnectContext context = context(MANAGED_USER);
-        QueryStatement baseDefinition = parse("SELECT payload FROM ranger_other.denied_events");
-        QueryStatement hiddenFunctionDefinition = parse("SELECT HOST_NAME()");
+        List<QueryStatement> definitions = List.of(
+                parse("SELECT channel_id, payload FROM gateway_test.events"),
+                parse("SELECT 'channel-a' AS channel_id, payload FROM gateway_test.events"),
+                parse("SELECT channel_id, COUNT(*) FROM gateway_test.events GROUP BY channel_id"),
+                parse("SELECT payload FROM ranger_other.denied_events"));
 
         try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class)) {
             authorizer.when(() -> Authorizer.isRangerManagedContext(context)).thenReturn(true);
-            authorizer.when(() -> Authorizer.check(baseDefinition, context))
-                    .thenThrow(new SecurityException("base denied"));
-
-            Assertions.assertThrows(SecurityException.class,
-                    () -> ColumnPrivilege.check(
-                            context, throughMaterializedView(baseDefinition, 31), List.of()));
-            ErrorReportException exception = Assertions.assertThrows(ErrorReportException.class,
-                    () -> ColumnPrivilege.check(
-                            context, throughMaterializedView(hiddenFunctionDefinition, 32), List.of()));
-            Assertions.assertTrue(exception.getMessage().contains("HOST_NAME"), exception.getMessage());
+            for (int i = 0; i < definitions.size(); i++) {
+                QueryStatement definition = definitions.get(i);
+                long materializedViewId = 31 + i;
+                ErrorReportException exception = Assertions.assertThrows(ErrorReportException.class,
+                        () -> ColumnPrivilege.check(
+                                context, throughMaterializedView(definition, materializedViewId), List.of()));
+                Assertions.assertTrue(exception.getMessage().contains("Ranger-managed materialized view: " +
+                        "test.managed_materialized_view_" + materializedViewId), exception.getMessage());
+                authorizer.verify(() -> Authorizer.check(definition, context), Mockito.never());
+            }
             Assertions.assertTrue(context.getViewExpansionPath().isEmpty());
         }
     }
 
     @Test
-    public void testNestedMaterializedViewAndUnavailableDefinitionFailClosed() {
-        ConnectContext context = context(MANAGED_USER);
-        QueryStatement deniedBaseDefinition = parse("SELECT payload FROM ranger_other.denied_events");
-        QueryStatement nestedDefinition = throughMaterializedView(deniedBaseDefinition, 41);
-        QueryStatement outerQuery = throughMaterializedView(nestedDefinition, 42);
+    public void testOrdinaryMaterializedViewIsUnchanged() {
+        ConnectContext context = context("ordinary");
+        QueryStatement definition = parse("SELECT HOST_NAME()");
+        QueryStatement outerQuery = throughMaterializedView(definition, 41);
 
         try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class)) {
-            authorizer.when(() -> Authorizer.isRangerManagedContext(context)).thenReturn(true);
-            authorizer.when(() -> Authorizer.check(Mockito.any(QueryStatement.class), Mockito.same(context)))
-                    .thenAnswer(invocation -> {
-                        QueryStatement definition = invocation.getArgument(0);
-                        if (definition == deniedBaseDefinition) {
-                            throw new SecurityException("base denied");
-                        }
-                        RangerManagedViewSecurity.check(context, definition);
-                        return null;
-                    });
-
-            Assertions.assertThrows(SecurityException.class,
-                    () -> ColumnPrivilege.check(context, outerQuery, List.of()));
-            ErrorReportException exception = Assertions.assertThrows(ErrorReportException.class,
-                    () -> ColumnPrivilege.check(
-                            context, throughMaterializedView(null, 43), List.of()));
-            Assertions.assertTrue(exception.getMessage().contains("definition unavailable"), exception.getMessage());
+            authorizer.when(() -> Authorizer.isRangerManagedContext(context)).thenReturn(false);
+            Assertions.assertDoesNotThrow(() -> RangerManagedViewSecurity.check(context, outerQuery));
+            authorizer.verify(() -> Authorizer.check(definition, context), Mockito.never());
             Assertions.assertTrue(context.getViewExpansionPath().isEmpty());
         }
     }
@@ -228,7 +216,6 @@ public class RangerManagedViewSecurityTest {
         MaterializedView materializedView = Mockito.mock(MaterializedView.class);
         Mockito.when(materializedView.getId()).thenReturn(materializedViewId);
         Mockito.when(materializedView.getName()).thenReturn(viewName);
-        Mockito.when(materializedView.getDefineQueryParseNode()).thenReturn(definition);
         TableRelation tableRelation = new TableRelation(
                 new TableName("default_catalog", "test", viewName));
         tableRelation.setTable(materializedView);
