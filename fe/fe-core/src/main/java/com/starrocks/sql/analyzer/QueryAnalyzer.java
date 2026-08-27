@@ -654,6 +654,7 @@ public class QueryAnalyzer {
                     }
                 }
 
+                Authorizer.checkRangerManagedResolvedTableBeforePolicyRewrite(tableRelation, session);
                 if (!r.isNeedRewrittenByPolicy()) {
                     return r;
                 }

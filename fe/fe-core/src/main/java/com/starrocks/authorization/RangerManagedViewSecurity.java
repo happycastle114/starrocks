@@ -129,6 +129,13 @@ public final class RangerManagedViewSecurity {
         new ForbiddenDefinitionVisitor(ValidationScope.STORED_DEFINITION, context).visit(statement);
     }
 
+    public static void checkResolvedTableBeforePolicyRewrite(ConnectContext context, TableRelation relation) {
+        if (!shouldCheck(context)) {
+            return;
+        }
+        denyMaterializedView(relation);
+    }
+
     private static boolean shouldCheck(ConnectContext context) {
         return context != null
                 && !context.isBypassAuthorizerCheck()
@@ -196,12 +203,7 @@ public final class RangerManagedViewSecurity {
 
         @Override
         public Void visitTable(TableRelation relation, Void ignored) {
-            if (!(relation.getTable() instanceof MaterializedView materializedView)) {
-                return null;
-            }
-
-            deny(PrivilegeType.SELECT, ObjectType.MATERIALIZED_VIEW,
-                    String.valueOf(relation.getName()), MATERIALIZED_VIEW_SCOPE);
+            denyMaterializedView(relation);
             return null;
         }
 
@@ -217,6 +219,13 @@ public final class RangerManagedViewSecurity {
             } finally {
                 path.remove(pathKey);
             }
+        }
+    }
+
+    private static void denyMaterializedView(TableRelation relation) {
+        if (relation.getTable() instanceof MaterializedView) {
+            deny(PrivilegeType.SELECT, ObjectType.MATERIALIZED_VIEW,
+                    String.valueOf(relation.getName()), MATERIALIZED_VIEW_SCOPE);
         }
     }
 

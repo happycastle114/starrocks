@@ -14,6 +14,9 @@
 
 package com.starrocks.sql;
 
+import com.starrocks.analysis.SlotRef;
+import com.starrocks.analysis.TableName;
+import com.starrocks.authorization.SecurityPolicyRewriteRule;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.InternalCatalog;
@@ -255,6 +258,41 @@ public class StatementPlannerRangerManagedQueryAuthorizationTest extends PlanTes
                     exception.getMessage());
         } finally {
             database.unRegisterTableUnlocked(view);
+        }
+    }
+
+    @Test
+    public void testManagedAsyncMaterializedViewIsDeniedBeforeRowPolicyAnalysis() throws Exception {
+        String materializedView = "managed_aggregate_async_mv";
+        starRocksAssert.withMaterializedView(
+                "CREATE MATERIALIZED VIEW test." + materializedView + " " +
+                        "DISTRIBUTED BY RANDOM BUCKETS 1 " +
+                        "REFRESH DEFERRED MANUAL " +
+                        "PROPERTIES ('replication_num' = '1') " +
+                        "AS SELECT COUNT(*) AS tenant_count FROM test.t0");
+        AtomicInteger rowPolicyCalls = new AtomicInteger();
+
+        try {
+            QueryStatement statement = parse("SELECT tenant_count FROM test." + materializedView);
+            SecurityPolicyRewriteRule.markRelationsForRewrite(statement);
+            try (MockedStatic<Authorizer> authorizer =
+                         Mockito.mockStatic(Authorizer.class, Mockito.CALLS_REAL_METHODS)) {
+                authorizer.when(() -> Authorizer.isRangerManagedContext(connectContext)).thenReturn(true);
+                authorizer.when(() -> Authorizer.getRowAccessPolicy(
+                                Mockito.same(connectContext), Mockito.any(TableName.class)))
+                        .thenAnswer(invocation -> {
+                            rowPolicyCalls.incrementAndGet();
+                            return new SlotRef(null, "channel_id");
+                        });
+
+                ErrorReportException exception = Assertions.assertThrows(ErrorReportException.class,
+                        () -> StatementPlanner.plan(statement, connectContext));
+                Assertions.assertTrue(exception.getMessage().contains(
+                        "Ranger-managed materialized view: test." + materializedView), exception.getMessage());
+                Assertions.assertEquals(0, rowPolicyCalls.get());
+            }
+        } finally {
+            starRocksAssert.dropMaterializedView("test." + materializedView);
         }
     }
 

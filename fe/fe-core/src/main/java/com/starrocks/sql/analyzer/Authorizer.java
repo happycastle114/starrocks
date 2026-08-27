@@ -42,6 +42,7 @@ import com.starrocks.server.WarehouseManager;
 import com.starrocks.sql.ast.CreateDictionaryStmt;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.StatementBase;
+import com.starrocks.sql.ast.TableRelation;
 import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.sql.ast.pipe.PipeName;
 import com.starrocks.statistic.AnalyzeJob;
@@ -96,6 +97,11 @@ public class Authorizer {
     public static void checkRangerManagedStoredDefinitionBeforeAnalysis(
             QueryStatement statement, ConnectContext context) {
         RangerManagedViewSecurity.checkStoredDefinitionBeforeAnalysis(context, statement);
+    }
+
+    public static void checkRangerManagedResolvedTableBeforePolicyRewrite(
+            TableRelation relation, ConnectContext context) {
+        RangerManagedViewSecurity.checkResolvedTableBeforePolicyRewrite(context, relation);
     }
 
     public static void checkDictionaryCreateBeforeAnalyze(
