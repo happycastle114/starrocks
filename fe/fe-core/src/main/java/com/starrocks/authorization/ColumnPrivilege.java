@@ -15,6 +15,7 @@
 package com.starrocks.authorization;
 
 import com.google.common.collect.Maps;
+import com.starrocks.analysis.Parameter;
 import com.starrocks.analysis.TableName;
 import com.starrocks.catalog.BasicTable;
 import com.starrocks.catalog.Column;
@@ -27,6 +28,7 @@ import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.analyzer.Analyzer;
 import com.starrocks.sql.analyzer.Authorizer;
+import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.AstTraverser;
 import com.starrocks.sql.ast.DeleteStmt;
 import com.starrocks.sql.ast.InsertStmt;
@@ -89,7 +91,11 @@ public class ColumnPrivilege {
         }
 
         Set<TableName> tableUsedExternalAccessController = new HashSet<>();
-        for (TableName tableName : tableNameTableObj.keySet()) {
+        for (Map.Entry<TableName, Table> entry : tableNameTableObj.entrySet()) {
+            TableName tableName = entry.getKey();
+            if (excludeTables.contains(tableName) || entry.getValue() instanceof MetadataTable) {
+                continue;
+            }
             String catalog = tableName.getCatalog() == null ?
                     InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME : tableName.getCatalog();
             if (Authorizer.getInstance().getAccessControlOrDefault(catalog, context) instanceof
@@ -99,30 +105,38 @@ public class ColumnPrivilege {
         }
 
         Map<TableName, Set<String>> scanColumns = new HashMap<>();
-        OptExpression optimizedPlan;
         if (!tableUsedExternalAccessController.isEmpty()) {
             /*
              * The column access privilege of the query need to use the pruned column list.
              * Because the unused columns will not check the column access privilege.
              * For example, the table contains two columns v1 and v2, and user u1 only has
              * the access privilege to v1, the select v1 from (select * from tbl) t can be checked because v2 has been pruned.
-             */
-            ColumnRefFactory columnRefFactory = new ColumnRefFactory();
-            LogicalPlan logicalPlan;
-            MVTransformerContext mvTransformerContext = MVTransformerContext.of(context, true);
-            TransformerContext transformerContext = new TransformerContext(columnRefFactory, context, mvTransformerContext);
-            logicalPlan = new RelationTransformer(transformerContext).transformWithSelectLimit(stmt.getQueryRelation());
+            */
+            if (hasUnboundParameter(stmt)) {
+                scanColumns.putAll(collectColumnsForUnboundPrepare(
+                        tableNameTableObj, tableUsedExternalAccessController));
+            } else {
+                ColumnRefFactory columnRefFactory = new ColumnRefFactory();
+                LogicalPlan logicalPlan;
+                MVTransformerContext mvTransformerContext = MVTransformerContext.of(context, true);
+                TransformerContext transformerContext =
+                        new TransformerContext(columnRefFactory, context, mvTransformerContext);
+                logicalPlan = new RelationTransformer(transformerContext)
+                        .transformWithSelectLimit(stmt.getQueryRelation());
 
-            OptimizerOptions optimizerOptions = new OptimizerOptions(OptimizerOptions.OptimizerStrategy.RULE_BASED);
-            optimizerOptions.disableRule(RuleType.GP_SINGLE_TABLE_MV_REWRITE);
-            optimizerOptions.disableRule(RuleType.GP_MULTI_TABLE_MV_REWRITE);
-            optimizerOptions.disableRule(RuleType.GP_PRUNE_EMPTY_OPERATOR);
-            Optimizer optimizer =
-                    OptimizerFactory.create(OptimizerFactory.initContext(context, columnRefFactory, optimizerOptions));
-            optimizedPlan = optimizer.optimize(logicalPlan.getRoot(),
-                    new PhysicalPropertySet(), new ColumnRefSet(logicalPlan.getOutputColumn()));
+                OptimizerOptions optimizerOptions =
+                        new OptimizerOptions(OptimizerOptions.OptimizerStrategy.RULE_BASED);
+                optimizerOptions.disableRule(RuleType.GP_SINGLE_TABLE_MV_REWRITE);
+                optimizerOptions.disableRule(RuleType.GP_MULTI_TABLE_MV_REWRITE);
+                optimizerOptions.disableRule(RuleType.GP_PRUNE_EMPTY_OPERATOR);
+                Optimizer optimizer = OptimizerFactory.create(
+                        OptimizerFactory.initContext(context, columnRefFactory, optimizerOptions));
+                OptExpression optimizedPlan = optimizer.optimize(logicalPlan.getRoot(),
+                        new PhysicalPropertySet(), new ColumnRefSet(logicalPlan.getOutputColumn()));
 
-            optimizedPlan.getOp().accept(new ScanColumnCollector(tableObjectToTableName, scanColumns), optimizedPlan, null);
+                optimizedPlan.getOp().accept(
+                        new ScanColumnCollector(tableObjectToTableName, scanColumns), optimizedPlan, null);
+            }
         }
 
         for (Map.Entry<TableName, Table> entry : tableNameTableObj.entrySet()) {
@@ -205,6 +219,47 @@ public class ColumnPrivilege {
                 }
             }
         }
+    }
+
+    private static boolean hasUnboundParameter(QueryStatement statement) {
+        boolean[] found = {false};
+        new AstTraverser<Void, Void>() {
+            @Override
+            public Void visitParameterExpr(Parameter parameter, Void context) {
+                found[0] |= parameter.getExpr() == null;
+                return null;
+            }
+        }.visit(statement);
+        return found[0];
+    }
+
+    /**
+     * An unbound PREPARE parameter cannot be translated by the optimizer yet. Binding a dummy
+     * value could also prune a security-relevant branch and under-check column privileges. AST
+     * alias collection is not scope-safe for repeated table aliases, so authorize every
+     * user-visible base-schema column of each external table.
+     */
+    private static Map<TableName, Set<String>> collectColumnsForUnboundPrepare(
+            Map<TableName, Table> tables, Set<TableName> externalTables) {
+        Map<TableName, Set<String>> conservative = new HashMap<>();
+        for (TableName tableName : externalTables) {
+            Table table = tables.get(tableName);
+            if (table == null) {
+                throw new SemanticException(
+                        "Cannot resolve table %s while authorizing an unbound prepared statement",
+                        tableName);
+            }
+
+            Set<String> columns = new HashSet<>();
+            table.getBaseSchema().forEach(column -> columns.add(column.getName()));
+            if (columns.isEmpty()) {
+                throw new SemanticException(
+                        "Cannot determine columns for table %s while authorizing an unbound prepared statement",
+                        tableName);
+            }
+            conservative.put(tableName, columns);
+        }
+        return conservative;
     }
 
     public static class ScanColumnCollector extends OptExpressionVisitor<Void, Void> {

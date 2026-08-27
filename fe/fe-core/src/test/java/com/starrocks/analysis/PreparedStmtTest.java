@@ -14,11 +14,20 @@
 
 package com.starrocks.analysis;
 
+import com.starrocks.authorization.AccessControlProvider;
+import com.starrocks.authorization.AccessController;
+import com.starrocks.authorization.AccessDeniedException;
+import com.starrocks.authorization.ExternalAccessController;
+import com.starrocks.authorization.PrivilegeType;
+import com.starrocks.catalog.InternalCatalog;
 import com.starrocks.common.AnalysisException;
+import com.starrocks.common.ErrorReportException;
 import com.starrocks.common.jmockit.Deencapsulation;
+import com.starrocks.mysql.MysqlCommand;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.OriginStatement;
 import com.starrocks.qe.PrepareStmtContext;
+import com.starrocks.qe.SqlModeHelper;
 import com.starrocks.qe.StmtExecutor;
 import com.starrocks.sql.analyzer.AstToSQLBuilder;
 import com.starrocks.sql.analyzer.Authorizer;
@@ -26,8 +35,10 @@ import com.starrocks.sql.ast.ExecuteStmt;
 import com.starrocks.sql.ast.PrepareStmt;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.SelectRelation;
+import com.starrocks.sql.ast.SetStmt;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.TableRelation;
+import com.starrocks.sql.ast.UserVariable;
 import com.starrocks.sql.common.StarRocksPlannerException;
 import com.starrocks.sql.optimizer.LogicalPlanPrinter;
 import com.starrocks.sql.parser.SqlParser;
@@ -40,9 +51,11 @@ import org.junit.jupiter.api.Test;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
+import java.nio.charset.StandardCharsets;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -69,6 +82,14 @@ public class PreparedStmtTest{
             "\"replicated_storage\" = \"true\",\n" +
             "\"compression\" = \"LZ4\"\n" +
             "); ";
+    private static String createRlsTable = "CREATE TABLE `prepared_rls` (\n" +
+            "  `event_id` varchar(24) NOT NULL,\n" +
+            "  `channel_id` varchar(24) NOT NULL,\n" +
+            "  `event_order` int NOT NULL\n" +
+            ") ENGINE=OLAP\n" +
+            "DUPLICATE KEY(`event_id`)\n" +
+            "DISTRIBUTED BY HASH(`event_id`) BUCKETS 1\n" +
+            "PROPERTIES (\"replication_num\" = \"1\");";
 
 
     @BeforeAll
@@ -78,6 +99,7 @@ public class PreparedStmtTest{
         starRocksAssert = new StarRocksAssert(ctx);
         starRocksAssert.withDatabase("demo").useDatabase("demo");
         starRocksAssert.withTable(createTable);
+        starRocksAssert.withTable(createRlsTable);
     }
 
     @Test
@@ -248,6 +270,141 @@ public class PreparedStmtTest{
             Assertions.assertNull(metadataStmt.getParameters().get(0).getExpr());
         } finally {
             ctx.removePreparedStmt(name);
+        }
+    }
+
+    @Test
+    public void testBinaryPrepareWithRowPolicyKeepsParametersUnboundForMetadata() throws Exception {
+        String sql = "select event_id from prepared_rls where event_order > ?";
+        PrepareStmt prepareStmt = (PrepareStmt) SqlParser.parse(sql, ctx.getSessionVariable()).get(0);
+        prepareStmt.setName("binary_row_policy_stmt");
+        prepareStmt.setOrigStmt(new OriginStatement(sql, 0));
+        String setTenantSql = "SET @app_channel_id = from_base64('dGVuYW50LWE=')";
+        SetStmt setTenant = (SetStmt) SqlParser.parse(setTenantSql, ctx.getSessionVariable()).get(0);
+        UserVariable tenantVariable = (UserVariable) setTenant.getSetListItems().get(0);
+        tenantVariable.setEvaluatedExpression(
+                new VarBinaryLiteral("tenant-a".getBytes(StandardCharsets.UTF_8)));
+        ctx.modifyUserVariable(tenantVariable);
+        AccessControlProvider accessControlProvider = Authorizer.getInstance();
+        AccessController originalAccessControl = accessControlProvider.catalogToAccessControl.get(
+                InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME);
+        Set<String> checkedColumns = new HashSet<>();
+        AtomicReference<String> deniedColumn = new AtomicReference<>();
+        AtomicBoolean rowPolicyEnabled = new AtomicBoolean(true);
+        ExternalAccessController testAccessControl = new ExternalAccessController() {
+            @Override
+            public void checkColumnAction(ConnectContext ignoredContext, TableName ignoredTable,
+                                          String column, PrivilegeType ignoredPrivilege)
+                    throws AccessDeniedException {
+                checkedColumns.add(column);
+                if (column.equals(deniedColumn.get())) {
+                    throw new AccessDeniedException();
+                }
+            }
+        };
+        MysqlCommand originalCommand = ctx.getCommand();
+        try {
+            accessControlProvider.catalogToAccessControl.put(
+                    InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, testAccessControl);
+            Assertions.assertSame(testAccessControl, accessControlProvider.getAccessControlOrDefault(
+                    InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, ctx));
+            ctx.setCommand(MysqlCommand.COM_STMT_PREPARE);
+            try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(
+                    Authorizer.class, Mockito.CALLS_REAL_METHODS)) {
+                authorizer.when(() -> Authorizer.getColumnMaskingPolicy(
+                                Mockito.any(), Mockito.any(), Mockito.any()))
+                        .thenReturn(Map.of());
+                authorizer.when(() -> Authorizer.getRowAccessPolicy(Mockito.any(), Mockito.any()))
+                        .thenAnswer(invocation -> rowPolicyEnabled.get()
+                                ? SqlParser.parseSqlToExpr(
+                                        "channel_id = @app_channel_id", SqlModeHelper.MODE_DEFAULT)
+                                : null);
+
+                StmtExecutor executor = new StmtExecutor(ctx, prepareStmt);
+                assertDoesNotThrow(() -> Deencapsulation.invoke(executor, "generateExecPlan"),
+                        "COM_STMT_PREPARE must analyze metadata without translating an unbound parameter");
+                authorizer.verify(() -> Authorizer.getRowAccessPolicy(Mockito.any(), Mockito.any()));
+                String analyzedSql = AstToSQLBuilder.toSQL(prepareStmt.getInnerStmt());
+                Assertions.assertTrue(analyzedSql.contains("app_channel_id"), analyzedSql);
+                Assertions.assertEquals(Set.of("channel_id", "event_id", "event_order"), checkedColumns);
+                Assertions.assertNull(prepareStmt.getParameters().get(0).getExpr());
+
+                deniedColumn.set("channel_id");
+                String wildcardSql = "select * from prepared_rls where event_order > ?";
+                PrepareStmt deniedPrepare = (PrepareStmt) SqlParser.parse(
+                        wildcardSql, ctx.getSessionVariable()).get(0);
+                deniedPrepare.setName("binary_row_policy_denied_stmt");
+                deniedPrepare.setOrigStmt(new OriginStatement(wildcardSql, 0));
+                StmtExecutor deniedExecutor = new StmtExecutor(ctx, deniedPrepare);
+                ErrorReportException denied = assertThrows(ErrorReportException.class,
+                        () -> Deencapsulation.invoke(deniedExecutor, "generateExecPlan"));
+                Assertions.assertTrue(denied.getMessage().contains("Access denied"), denied.getMessage());
+
+                rowPolicyEnabled.set(false);
+                deniedColumn.set("event_id");
+                String countSql = "select count(*) from prepared_rls where ? > 0";
+                PrepareStmt countPrepare = (PrepareStmt) SqlParser.parse(
+                        countSql, ctx.getSessionVariable()).get(0);
+                countPrepare.setName("binary_count_denied_stmt");
+                countPrepare.setOrigStmt(new OriginStatement(countSql, 0));
+                StmtExecutor countExecutor = new StmtExecutor(ctx, countPrepare);
+                ErrorReportException countDenied = assertThrows(ErrorReportException.class,
+                        () -> Deencapsulation.invoke(countExecutor, "generateExecPlan"));
+                Assertions.assertTrue(countDenied.getMessage().contains("COLUMN event_id"),
+                        countDenied.getMessage());
+                Assertions.assertTrue(checkedColumns.contains("event_id"), checkedColumns.toString());
+            }
+        } finally {
+            accessControlProvider.catalogToAccessControl.put(
+                    InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, originalAccessControl);
+            ctx.setCommand(originalCommand);
+            ctx.removePreparedStmt(prepareStmt.getName());
+            ctx.removePreparedStmt("binary_row_policy_denied_stmt");
+            ctx.removePreparedStmt("binary_count_denied_stmt");
+            ctx.getUserVariables().remove("app_channel_id");
+        }
+    }
+
+    @Test
+    public void testBinaryPrepareSelfJoinAuthorizesFullSchema() throws Exception {
+        String sql = "select a.event_id from prepared_rls a join prepared_rls b " +
+                "on a.event_id = b.event_order where ? > 0";
+        PrepareStmt prepareStmt = (PrepareStmt) SqlParser.parse(sql, ctx.getSessionVariable()).get(0);
+        prepareStmt.setName("binary_self_join_stmt");
+        prepareStmt.setOrigStmt(new OriginStatement(sql, 0));
+        AccessControlProvider accessControlProvider = Authorizer.getInstance();
+        AccessController originalAccessControl = accessControlProvider.catalogToAccessControl.get(
+                InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME);
+        Set<String> checkedColumns = new HashSet<>();
+        ExternalAccessController testAccessControl = new ExternalAccessController() {
+            @Override
+            public void checkColumnAction(ConnectContext ignoredContext, TableName ignoredTable,
+                                          String column, PrivilegeType ignoredPrivilege)
+                    throws AccessDeniedException {
+                checkedColumns.add(column);
+                if (column.equals("channel_id")) {
+                    throw new AccessDeniedException();
+                }
+            }
+        };
+        MysqlCommand originalCommand = ctx.getCommand();
+        try {
+            accessControlProvider.catalogToAccessControl.put(
+                    InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, testAccessControl);
+            Assertions.assertSame(testAccessControl, accessControlProvider.getAccessControlOrDefault(
+                    InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, ctx));
+            ctx.setCommand(MysqlCommand.COM_STMT_PREPARE);
+
+            StmtExecutor executor = new StmtExecutor(ctx, prepareStmt);
+            ErrorReportException denied = assertThrows(ErrorReportException.class,
+                    () -> Deencapsulation.invoke(executor, "generateExecPlan"));
+            Assertions.assertTrue(denied.getMessage().contains("COLUMN channel_id"), denied.getMessage());
+            Assertions.assertTrue(checkedColumns.contains("channel_id"), checkedColumns.toString());
+        } finally {
+            accessControlProvider.catalogToAccessControl.put(
+                    InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, originalAccessControl);
+            ctx.setCommand(originalCommand);
+            ctx.removePreparedStmt(prepareStmt.getName());
         }
     }
 
