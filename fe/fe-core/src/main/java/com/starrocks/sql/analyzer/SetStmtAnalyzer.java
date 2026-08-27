@@ -26,6 +26,7 @@ import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.StringLiteral;
 import com.starrocks.analysis.Subquery;
 import com.starrocks.authentication.UserAuthenticationInfo;
+import com.starrocks.authorization.SecurityPolicyRewriteRule;
 import com.starrocks.catalog.ArrayType;
 import com.starrocks.catalog.IndexParams;
 import com.starrocks.catalog.PrimitiveType;
@@ -603,6 +604,10 @@ public class SetStmtAnalyzer {
         if (expression instanceof NullLiteral) {
             userVariable.setEvaluatedExpression(NullLiteral.create(Type.STRING));
         } else {
+            List<Subquery> subqueries = Lists.newArrayList();
+            expression.collect(Subquery.class, subqueries);
+            subqueries.forEach(subquery ->
+                    SecurityPolicyRewriteRule.markRelationsForRewrite(subquery.getQueryStatement()));
             Expr foldedExpression;
             foldedExpression = Expr.analyzeAndCastFold(expression);
 

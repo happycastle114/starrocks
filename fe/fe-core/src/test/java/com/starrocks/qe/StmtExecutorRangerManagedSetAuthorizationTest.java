@@ -15,14 +15,20 @@
 package com.starrocks.qe;
 
 import com.starrocks.common.ErrorReportException;
+import com.starrocks.sql.StatementPlanner;
 import com.starrocks.sql.analyzer.Analyzer;
+import com.starrocks.sql.analyzer.AnalyzerUtils;
 import com.starrocks.sql.analyzer.Authorizer;
+import com.starrocks.sql.analyzer.SetStmtAnalyzer;
 import com.starrocks.sql.analyzer.StorageAccessException;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.SetStmt;
 import com.starrocks.sql.ast.StatementBase;
+import com.starrocks.sql.ast.UserVariable;
 import com.starrocks.sql.parser.SqlParser;
+import com.starrocks.sql.plan.ExecPlan;
 import com.starrocks.sql.plan.PlanTestBase;
+import com.starrocks.thrift.TResultSinkType;
 import mockit.Mock;
 import mockit.MockUp;
 import org.junit.jupiter.api.Assertions;
@@ -30,6 +36,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class StmtExecutorRangerManagedSetAuthorizationTest extends PlanTestBase {
@@ -73,6 +80,42 @@ public class StmtExecutorRangerManagedSetAuthorizationTest extends PlanTestBase 
                     exception.getMessage());
             Assertions.assertEquals(0, analyzerCalls.get());
         }
+    }
+
+    @Test
+    public void testDirectSetSubqueryMarksGeneratedQueryForPolicyRewriteBeforePlanning() {
+        SetStmt statement = (SetStmt) parse(
+                "SET @protected_value = (SELECT MAX(v1) FROM test.tview)");
+        UserVariable userVariable = (UserVariable) statement.getSetListItems().get(0);
+        Analyzer.analyze(statement, connectContext);
+        SetStmtAnalyzer.calcuteUserVariable(userVariable);
+
+        AtomicBoolean sawPolicyMarkedView = new AtomicBoolean();
+        AtomicBoolean sawOnlyPolicyMarkedBaseRelations = new AtomicBoolean();
+        new MockUp<StatementPlanner>() {
+            @Mock
+            public ExecPlan plan(StatementBase generatedQuery, ConnectContext context,
+                                 TResultSinkType resultSinkType) {
+                var views = AnalyzerUtils.collectViewRelations(generatedQuery);
+                var baseRelations = AnalyzerUtils.collectTableRelations(generatedQuery);
+                sawPolicyMarkedView.set(
+                        !views.isEmpty() && views.stream()
+                                .allMatch(relation -> relation.isNeedRewrittenByPolicy()));
+                sawOnlyPolicyMarkedBaseRelations.set(
+                        !baseRelations.isEmpty() && baseRelations.stream()
+                                .allMatch(relation -> relation.isNeedRewrittenByPolicy()));
+                throw new StopPlanningException();
+            }
+        };
+
+        try (var guard = connectContext.bindScope()) {
+            Assertions.assertThrows(StopPlanningException.class,
+                    () -> userVariable.deriveUserVariableExpressionResult(connectContext));
+        }
+        Assertions.assertTrue(sawPolicyMarkedView.get(),
+                "generated user-variable query must mark its expanded view before first analysis");
+        Assertions.assertTrue(sawOnlyPolicyMarkedBaseRelations.get(),
+                "generated user-variable query must mark every nested base relation");
     }
 
     @Test
@@ -127,5 +170,8 @@ public class StmtExecutorRangerManagedSetAuthorizationTest extends PlanTestBase 
     }
 
     private static class StopAnalysisException extends RuntimeException {
+    }
+
+    private static class StopPlanningException extends RuntimeException {
     }
 }

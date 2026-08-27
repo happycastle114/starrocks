@@ -34,9 +34,17 @@
 
 package com.starrocks.http;
 
+import com.starrocks.qe.ConnectContext;
 import com.starrocks.rpc.ConfigurableSerDesFactory;
 import com.starrocks.server.WarehouseManager;
+import com.starrocks.sql.StatementPlanner;
+import com.starrocks.sql.analyzer.AnalyzerUtils;
+import com.starrocks.sql.ast.StatementBase;
+import com.starrocks.sql.plan.ExecPlan;
 import com.starrocks.thrift.TQueryPlanInfo;
+import mockit.Invocation;
+import mockit.Mock;
+import mockit.MockUp;
 import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
@@ -48,6 +56,7 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.util.Base64;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class TableQueryPlanActionTest extends StarRocksHttpTestCase {
 
@@ -63,6 +72,19 @@ public class TableQueryPlanActionTest extends StarRocksHttpTestCase {
     @Test
     public void testQueryPlanAction() throws Exception {
         super.setUpWithCatalog();
+        AtomicBoolean sawPolicyMarkedRelations = new AtomicBoolean();
+        new MockUp<StatementPlanner>() {
+            @Mock
+            public ExecPlan plan(
+                    Invocation invocation, StatementBase statement, ConnectContext context) {
+                var relations = AnalyzerUtils.collectAllTableAndViewRelations(statement);
+                sawPolicyMarkedRelations.set(
+                        !relations.isEmpty() && relations.values().stream()
+                                .allMatch(relation -> relation.isNeedRewrittenByPolicy()));
+                return invocation.proceed();
+            }
+        };
+
         RequestBody body =
                 RequestBody.create(JSON, "{ \"sql\" :  \" select k1 as alias_1,k2 from " + DB_NAME + "." + TABLE_NAME + " \" }");
         Request request = new Request.Builder()
@@ -96,6 +118,8 @@ public class TableQueryPlanActionTest extends StarRocksHttpTestCase {
             Assertions.assertEquals("alias_1", tQueryPlanInfo.output_names.get(0));
             expectThrowsNoException(() -> deserializer.deserialize(tQueryPlanInfo, binaryPlanInfo));
         }
+        Assertions.assertTrue(sawPolicyMarkedRelations.get(),
+                "query-plan REST must mark every relation before planner analysis");
     }
 
     @Test

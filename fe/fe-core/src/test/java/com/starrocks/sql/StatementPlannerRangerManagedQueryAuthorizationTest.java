@@ -14,21 +14,30 @@
 
 package com.starrocks.sql;
 
+import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.BinaryType;
+import com.starrocks.analysis.IntLiteral;
 import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.TableName;
 import com.starrocks.authorization.SecurityPolicyRewriteRule;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.InternalCatalog;
+import com.starrocks.catalog.MysqlTable;
+import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Type;
 import com.starrocks.catalog.View;
 import com.starrocks.common.ErrorReportException;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.Analyzer;
+import com.starrocks.sql.analyzer.AnalyzerUtils;
 import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.analyzer.PlannerMetaLocker;
+import com.starrocks.sql.analyzer.PreAnalyzerAuthorization;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.StatementBase;
+import com.starrocks.sql.ast.TableRelation;
 import com.starrocks.sql.parser.SqlParser;
 import com.starrocks.sql.plan.PlanTestBase;
 import com.starrocks.sql.spm.SPMPlanner;
@@ -293,6 +302,105 @@ public class StatementPlannerRangerManagedQueryAuthorizationTest extends PlanTes
             }
         } finally {
             starRocksAssert.dropMaterializedView("test." + materializedView);
+        }
+    }
+
+    @Test
+    public void testManagedResolvedExternalTableAndStoredViewAreDeniedAfterAnalyzer() throws Exception {
+        Database database = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test");
+        MysqlTable externalTable = new MysqlTable(987654322L, "managed_external_mysql",
+                List.of(new Column("channel_id", Type.BIGINT), new Column("value", Type.VARCHAR)),
+                Map.of(
+                        "host", "127.0.0.1",
+                        "port", "18080",
+                        "user", "recorder",
+                        "password", "",
+                        "database", "test",
+                        "table", "managed_external_mysql_remote"));
+        View externalView = new View(987654323L, "managed_external_mysql_view",
+                List.of(new Column("channel_id", Type.BIGINT), new Column("value", Type.VARCHAR)));
+        externalView.setInlineViewDefWithSqlMode(
+                "SELECT channel_id, value FROM test.managed_external_mysql", 0);
+        Assertions.assertTrue(database.registerTableUnlocked(externalTable));
+        Assertions.assertTrue(database.registerTableUnlocked(externalView));
+
+        QueryStatement directStatement = parse("SELECT * FROM test.managed_external_mysql");
+        QueryStatement viewStatement = parse("SELECT * FROM test.managed_external_mysql_view");
+        List<QueryStatement> managedStatements = List.of(directStatement, viewStatement);
+        managedStatements.forEach(SecurityPolicyRewriteRule::markRelationsForRewrite);
+        AtomicInteger rowPolicyCalls = new AtomicInteger();
+        AtomicInteger authorizationCalls = new AtomicInteger();
+        try (MockedStatic<Authorizer> authorizer =
+                     Mockito.mockStatic(Authorizer.class, Mockito.CALLS_REAL_METHODS)) {
+            authorizer.when(() -> Authorizer.isRangerManagedContext(connectContext)).thenReturn(true);
+            authorizer.when(() -> Authorizer.getColumnMaskingPolicy(
+                            Mockito.same(connectContext), Mockito.any(TableName.class), Mockito.anyList()))
+                    .thenReturn(Map.of());
+            authorizer.when(() -> Authorizer.getRowAccessPolicy(
+                            Mockito.same(connectContext), Mockito.any(TableName.class)))
+                    .thenAnswer(invocation -> {
+                        rowPolicyCalls.incrementAndGet();
+                        return new BinaryPredicate(BinaryType.EQ,
+                                new SlotRef(null, "channel_id"), new IntLiteral(1));
+                    });
+            authorizer.when(() -> Authorizer.check(
+                            Mockito.any(StatementBase.class), Mockito.same(connectContext)))
+                    .thenAnswer(invocation -> {
+                        authorizationCalls.incrementAndGet();
+                        return null;
+                    });
+
+            for (QueryStatement statement : managedStatements) {
+                ErrorReportException exception = Assertions.assertThrows(ErrorReportException.class,
+                        () -> StatementPlanner.plan(statement, connectContext));
+                Assertions.assertTrue(exception.getMessage().contains(
+                        "Ranger-managed query: test.managed_external_mysql (MYSQL)"), exception.getMessage());
+                Assertions.assertTrue(AnalyzerUtils.collectTableRelations(statement).stream()
+                        .map(TableRelation::getTable)
+                        .anyMatch(table -> table != null
+                                && table.getType() == Table.TableType.MYSQL
+                                && "managed_external_mysql".equals(table.getName())));
+            }
+            Assertions.assertTrue(rowPolicyCalls.get() >= managedStatements.size());
+            Assertions.assertEquals(0, authorizationCalls.get());
+
+            authorizer.when(() -> Authorizer.isRangerManagedContext(connectContext)).thenReturn(false);
+            Assertions.assertDoesNotThrow(() -> PreAnalyzerAuthorization.authorizeAfter(
+                    directStatement, connectContext, PreAnalyzerAuthorization.Result.FULL_STATEMENT));
+
+            connectContext.setBypassAuthorizerCheck(true);
+            authorizer.when(() -> Authorizer.isRangerManagedContext(connectContext)).thenReturn(true);
+            Assertions.assertDoesNotThrow(() -> PreAnalyzerAuthorization.authorizeAfter(
+                    directStatement, connectContext, PreAnalyzerAuthorization.Result.FULL_STATEMENT));
+        } finally {
+            connectContext.setBypassAuthorizerCheck(false);
+            database.unRegisterTableUnlocked(externalView);
+            database.unRegisterTableUnlocked(externalTable);
+        }
+    }
+
+    @Test
+    public void testManagedResolvedNativeViewAndRequiredSchemaTablePassExternalGuard() {
+        Database database = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test");
+        View nativeView = new View(987654324L, "managed_native_view",
+                List.of(new Column("v1", Type.BIGINT)));
+        nativeView.setInlineViewDefWithSqlMode("SELECT v1 FROM test.t0", 0);
+        Assertions.assertTrue(database.registerTableUnlocked(nativeView));
+
+        try (MockedStatic<Authorizer> authorizer =
+                     Mockito.mockStatic(Authorizer.class, Mockito.CALLS_REAL_METHODS)) {
+            authorizer.when(() -> Authorizer.isRangerManagedContext(connectContext)).thenReturn(true);
+            List<QueryStatement> statements = List.of(
+                    parse("SELECT * FROM test.managed_native_view"),
+                    parse("SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.tables"));
+
+            for (QueryStatement statement : statements) {
+                Analyzer.analyze(statement, connectContext);
+                Assertions.assertDoesNotThrow(() -> PreAnalyzerAuthorization.authorizeAfter(
+                        statement, connectContext, PreAnalyzerAuthorization.Result.FULL_STATEMENT));
+            }
+        } finally {
+            database.unRegisterTableUnlocked(nativeView);
         }
     }
 

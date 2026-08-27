@@ -41,8 +41,13 @@ import com.starrocks.server.RunMode;
 import com.starrocks.server.WarehouseManager;
 import com.starrocks.sql.StatementPlanner;
 import com.starrocks.sql.analyzer.Analyzer;
+import com.starrocks.sql.analyzer.AnalyzerUtils;
+import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.ast.InsertStmt;
+import com.starrocks.sql.ast.QueryStatement;
+import com.starrocks.sql.ast.Relation;
 import com.starrocks.sql.ast.ShowFrontendsStmt;
+import com.starrocks.sql.ast.ShowTableStmt;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.txn.BeginStmt;
 import com.starrocks.sql.ast.txn.CommitStmt;
@@ -73,8 +78,10 @@ import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class StmtExecutorTest {
     private static class DummyPlanNode extends PlanNode {
@@ -236,6 +243,66 @@ public class StmtExecutorTest {
         Assertions.assertEquals("Delete", executor.getExecType());
         Assertions.assertTrue(executor.isExecLoadType());
         Assertions.assertEquals(ConnectContext.get().getSessionVariable().getInsertTimeoutS(), executor.getExecTimeout());
+    }
+
+    @Test
+    public void testShowGeneratedQueryMarksRelationsForPolicyRewrite() throws Exception {
+        ConnectContext ctx = UtFrameUtils.createDefaultCtx();
+        ConnectContext.threadLocalInfo.set(ctx);
+
+        new MockUp<Analyzer>() {
+            @Mock
+            public void analyze(StatementBase ignoredStmt, ConnectContext ignoredCtx) {
+            }
+        };
+        new MockUp<Authorizer>() {
+            @Mock
+            public void check(StatementBase ignoredStmt, ConnectContext ignoredCtx) {
+            }
+        };
+
+        AtomicInteger planCalls = new AtomicInteger();
+        AtomicReference<QueryStatement> plannedStatement = new AtomicReference<>();
+        ExecPlan expectedPlan = buildMinimalExecPlan(1);
+        new MockUp<StatementPlanner>() {
+            @Mock
+            public ExecPlan plan(StatementBase statement, ConnectContext ignoredCtx) {
+                planCalls.incrementAndGet();
+                plannedStatement.set((QueryStatement) statement);
+                return expectedPlan;
+            }
+        };
+
+        String ordinarySql = "SHOW TABLES FROM visible_db";
+        ShowTableStmt ordinaryShow = (ShowTableStmt) SqlParser.parseSingleStatement(
+                ordinarySql, SqlModeHelper.MODE_DEFAULT);
+        ordinaryShow.setOrigStmt(new OriginStatement(ordinarySql, 0));
+        StmtExecutor ordinaryExecutor = new StmtExecutor(ctx, ordinaryShow);
+        Deencapsulation.setField(ordinaryExecutor, "isForwardToLeaderOpt", Optional.of(false));
+
+        ExecPlan ordinaryPlan = Deencapsulation.invoke(ordinaryExecutor, "generateExecPlan");
+        Assertions.assertNull(ordinaryPlan);
+        Assertions.assertEquals(0, planCalls.get(), "SHOW TABLES without WHERE must keep the metadata execution path");
+
+        String oracleSql = "SHOW TABLES FROM visible_db WHERE " +
+                "(SELECT count(*) FROM protected_db.protected_table WHERE tenant_id = 7) > 0";
+        ShowTableStmt oracleShow = (ShowTableStmt) SqlParser.parseSingleStatement(
+                oracleSql, SqlModeHelper.MODE_DEFAULT);
+        oracleShow.setOrigStmt(new OriginStatement(oracleSql, 0));
+        StmtExecutor oracleExecutor = new StmtExecutor(ctx, oracleShow);
+        Deencapsulation.setField(oracleExecutor, "isForwardToLeaderOpt", Optional.of(false));
+
+        ExecPlan actualPlan = Deencapsulation.invoke(oracleExecutor, "generateExecPlan");
+        Assertions.assertSame(expectedPlan, actualPlan);
+        Assertions.assertEquals(1, planCalls.get());
+
+        QueryStatement generatedQuery = plannedStatement.get();
+        Assertions.assertNotNull(generatedQuery);
+        var relations = AnalyzerUtils.collectAllTableAndViewRelations(generatedQuery);
+        Assertions.assertEquals(2, relations.size(),
+                "generated query must retain both information_schema.tables and the protected scalar-subquery table");
+        Assertions.assertTrue(relations.values().stream().allMatch(Relation::isNeedRewrittenByPolicy),
+                "every relation created or retained by SHOW conversion must be marked before planning");
     }
 
     @Test

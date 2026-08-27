@@ -16,10 +16,12 @@ package com.starrocks.authorization.ranger;
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.ArithmeticExpr;
 import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.CastExpr;
 import com.starrocks.analysis.CompoundPredicate;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.FunctionCallExpr;
 import com.starrocks.analysis.NullLiteral;
+import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.TableName;
 import com.starrocks.authorization.AccessControlProvider;
 import com.starrocks.authorization.AccessDeniedException;
@@ -29,10 +31,13 @@ import com.starrocks.authorization.ranger.hive.RangerHiveAccessController;
 import com.starrocks.authorization.ranger.starrocks.RangerStarRocksAccessController;
 import com.starrocks.authorization.ranger.starrocks.RangerStarRocksResource;
 import com.starrocks.catalog.Column;
+import com.starrocks.catalog.StructField;
+import com.starrocks.catalog.StructType;
 import com.starrocks.catalog.Type;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.SqlModeHelper;
 import com.starrocks.sql.analyzer.Authorizer;
+import com.starrocks.sql.analyzer.FeNameFormat;
 import com.starrocks.sql.ast.AstTraverser;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.Relation;
@@ -40,6 +45,7 @@ import com.starrocks.sql.ast.SelectRelation;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.SubqueryRelation;
 import com.starrocks.sql.ast.UserIdentity;
+import com.starrocks.sql.parser.ParsingException;
 import com.starrocks.sql.parser.SqlParser;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
@@ -63,6 +69,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class RangerInterfaceTest {
     static ConnectContext connectContext;
@@ -176,6 +183,98 @@ public class RangerInterfaceTest {
 
         e = rangerStarRocksAccessController.getColumnMaskingPolicy(connectContext, tableName, columns);
         Assertions.assertTrue(new ArrayList<>(e.values()).get(0) instanceof ArithmeticExpr);
+    }
+
+    @Test
+    public void testMaskingColumnPlaceholdersAreBoundInAst() {
+        String hostileColumnName = "x', sibling_value, 'y`";
+        Assertions.assertDoesNotThrow(() -> FeNameFormat.checkColumnName(hostileColumnName));
+        StructType hostileType = new StructType(List.of(
+                new StructField("x BIGINT>) + sibling_value, CAST(NULL AS STRUCT<y", Type.BIGINT,
+                        "comment'>) + sibling_value -- ")), true);
+        AtomicReference<String> transformer = new AtomicReference<>(
+                "coalesce({col}, `{col}`, cast({col} AS {type}), cast(`{col}` AS {type}))");
+
+        new MockUp<RangerBasePlugin>() {
+            @Mock
+            RangerAccessResult evalDataMaskPolicies(RangerAccessRequest request,
+                                                    RangerAccessResultProcessor resultProcessor) {
+                RangerAccessResult result = new RangerAccessResult(1, "starrocks",
+                        new RangerServiceDef(), new RangerAccessRequestImpl());
+                result.setMaskType(RangerPolicy.MASK_TYPE_CUSTOM);
+                result.setMaskedValue(transformer.get());
+                return result;
+            }
+        };
+
+        RangerStarRocksAccessController controller = new RangerStarRocksAccessController();
+        ConnectContext context = new ConnectContext();
+        context.setCurrentUserIdentity(UserIdentity.ROOT);
+        long callerSqlMode = SqlModeHelper.MODE_DEFAULT
+                | SqlModeHelper.MODE_PIPES_AS_CONCAT
+                | SqlModeHelper.MODE_ANSI_QUOTES;
+        context.getSessionVariable().setSqlMode(callerSqlMode);
+        TableName tableName = new TableName("db", "tbl");
+        Column column = new Column(hostileColumnName, hostileType);
+
+        Expr maskingExpression = controller.getColumnMaskingPolicy(
+                context, tableName, Lists.newArrayList(column)).get(hostileColumnName);
+
+        Assertions.assertInstanceOf(FunctionCallExpr.class, maskingExpression);
+        List<SlotRef> slotRefs = maskingExpression.collectAllSlotRefs();
+        Assertions.assertEquals(4, slotRefs.size());
+        slotRefs.forEach(slotRef -> Assertions.assertEquals(hostileColumnName, slotRef.getColumnName()));
+        List<CastExpr> castExprs = Lists.newArrayList();
+        maskingExpression.collect(CastExpr.class, castExprs);
+        Assertions.assertEquals(2, castExprs.size());
+        castExprs.forEach(castExpr -> Assertions.assertSame(
+                hostileType, castExpr.getTargetTypeDef().getType()));
+        Assertions.assertEquals(callerSqlMode, context.getSessionVariable().getSqlMode());
+
+        transformer.set("coalesce({col}, sibling_value)");
+        maskingExpression = controller.getColumnMaskingPolicy(
+                context, tableName, Lists.newArrayList(column)).get(hostileColumnName);
+        slotRefs = maskingExpression.collectAllSlotRefs();
+        Assertions.assertEquals(List.of(hostileColumnName, "sibling_value"),
+                slotRefs.stream().map(SlotRef::getColumnName).toList());
+    }
+
+    @Test
+    public void testMaskingColumnPlaceholdersFailClosedOutsideExactContexts() {
+        String columnName = "x', sibling_value, 'y";
+        AtomicReference<String> transformer = new AtomicReference<>();
+
+        new MockUp<RangerBasePlugin>() {
+            @Mock
+            RangerAccessResult evalDataMaskPolicies(RangerAccessRequest request,
+                                                    RangerAccessResultProcessor resultProcessor) {
+                RangerAccessResult result = new RangerAccessResult(1, "starrocks",
+                        new RangerServiceDef(), new RangerAccessRequestImpl());
+                result.setMaskType(RangerPolicy.MASK_TYPE_CUSTOM);
+                result.setMaskedValue(transformer.get());
+                return result;
+            }
+        };
+
+        RangerStarRocksAccessController controller = new RangerStarRocksAccessController();
+        ConnectContext context = new ConnectContext();
+        context.setCurrentUserIdentity(UserIdentity.ROOT);
+
+        List<String> invalidTransformers = List.of(
+                "concat('{col}')",
+                "concat(\"{col}\")",
+                "concat({col}) /* {col} */",
+                "coalesce({col}, {col}(1))",
+                "concat({col}.nested_field)",
+                "concat({col}, '{type}')",
+                "CAST({col} AS BIGINT) /* {type} */",
+                "CAST({col} AS ARRAY<{type}>)");
+        for (String invalidTransformer : invalidTransformers) {
+            transformer.set(invalidTransformer);
+            Assertions.assertThrows(ParsingException.class,
+                    () -> controller.getColumnMaskingPolicy(context, new TableName("db", "tbl"),
+                            Lists.newArrayList(new Column(columnName, Type.BIGINT))), invalidTransformer);
+        }
     }
 
     @Test

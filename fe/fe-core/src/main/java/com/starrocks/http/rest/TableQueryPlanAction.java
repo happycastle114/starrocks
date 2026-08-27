@@ -39,6 +39,7 @@ import com.google.common.collect.Maps;
 import com.starrocks.analysis.TableName;
 import com.starrocks.authorization.AccessDeniedException;
 import com.starrocks.authorization.PrivilegeType;
+import com.starrocks.authorization.SecurityPolicyRewriteRule;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.DdlException;
@@ -228,6 +229,7 @@ public class TableQueryPlanAction extends RestBaseAction {
             context.getSessionVariable().setSqlSelectLimit(SessionVariable.DEFAULT_SELECT_LIMIT);
             statementBase =
                     com.starrocks.sql.parser.SqlParser.parse(sql, context.getSessionVariable()).get(0);
+            SecurityPolicyRewriteRule.markRelationsForRewrite(statementBase);
             execPlan = StatementPlanner.plan(statementBase, context);
             context.getSessionVariable().setSingleNodeExecPlan(false);
             context.getSessionVariable().setSqlSelectLimit(limit);

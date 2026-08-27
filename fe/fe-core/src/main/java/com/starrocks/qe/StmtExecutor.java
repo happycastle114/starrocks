@@ -55,6 +55,7 @@ import com.starrocks.authorization.AccessDeniedException;
 import com.starrocks.authorization.ObjectType;
 import com.starrocks.authorization.PrivilegeException;
 import com.starrocks.authorization.PrivilegeType;
+import com.starrocks.authorization.SecurityPolicyRewriteRule;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.ExternalOlapTable;
@@ -698,6 +699,7 @@ public class StmtExecutor {
                     QueryStatement selectStmt = ((ShowStmt) parsedStmt).toSelectStmt();
                     if (selectStmt != null) {
                         parsedStmt = selectStmt;
+                        SecurityPolicyRewriteRule.markRelationsForRewrite(parsedStmt);
                         execPlan = StatementPlanner.plan(parsedStmt, context);
                     }
                 } else if (parsedStmt instanceof ExecuteStmt) {

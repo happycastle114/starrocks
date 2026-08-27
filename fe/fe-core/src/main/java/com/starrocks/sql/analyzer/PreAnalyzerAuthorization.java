@@ -19,10 +19,18 @@ import com.starrocks.authorization.AccessDeniedException;
 import com.starrocks.authorization.ObjectType;
 import com.starrocks.authorization.PrivilegeType;
 import com.starrocks.catalog.InternalCatalog;
+import com.starrocks.catalog.Table;
+import com.starrocks.common.ErrorCode;
+import com.starrocks.common.ErrorReportException;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.CatalogMgr;
+import com.starrocks.sql.ast.AddRollupClause;
+import com.starrocks.sql.ast.AlterMaterializedViewStatusClause;
+import com.starrocks.sql.ast.AlterMaterializedViewStmt;
+import com.starrocks.sql.ast.AlterTableStmt;
 import com.starrocks.sql.ast.AlterViewStmt;
 import com.starrocks.sql.ast.AstTraverser;
+import com.starrocks.sql.ast.AsyncRefreshSchemeDesc;
 import com.starrocks.sql.ast.CTERelation;
 import com.starrocks.sql.ast.CancelRefreshDictionaryStmt;
 import com.starrocks.sql.ast.CreateDictionaryStmt;
@@ -36,10 +44,13 @@ import com.starrocks.sql.ast.CreateViewStmt;
 import com.starrocks.sql.ast.DeleteStmt;
 import com.starrocks.sql.ast.DmlStmt;
 import com.starrocks.sql.ast.DropDictionaryStmt;
+import com.starrocks.sql.ast.ExportStmt;
 import com.starrocks.sql.ast.FileTableFunctionRelation;
+import com.starrocks.sql.ast.IncrementalRefreshSchemeDesc;
 import com.starrocks.sql.ast.InsertStmt;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.RefreshDictionaryStmt;
+import com.starrocks.sql.ast.RefreshMaterializedViewStatement;
 import com.starrocks.sql.ast.SelectRelation;
 import com.starrocks.sql.ast.SetOperationRelation;
 import com.starrocks.sql.ast.StatementBase;
@@ -114,6 +125,7 @@ public final class PreAnalyzerAuthorization {
 
     public static void authorizeAfter(
             StatementBase statement, ConnectContext session, Result result) {
+        checkRangerManagedResolvedTables(statement, session);
         switch (result) {
             case FULL_STATEMENT:
                 break;
@@ -126,6 +138,30 @@ public final class PreAnalyzerAuthorization {
                 break;
             default:
                 throw new IllegalStateException("Unknown pre-analysis authorization state: " + result);
+        }
+    }
+
+    private static void checkRangerManagedResolvedTables(
+            StatementBase statement, ConnectContext session) {
+        if (!(statement instanceof QueryStatement)
+                || session == null
+                || session.isBypassAuthorizerCheck()
+                || !Authorizer.isRangerManagedContext(session)) {
+            return;
+        }
+
+        for (TableRelation relation : AnalyzerUtils.collectTableRelations(statement)) {
+            Table table = relation.getTable();
+            if (table == null
+                    || table.isNativeTableOrMaterializedView()
+                    || table.isView()
+                    || table.getType() == Table.TableType.SCHEMA) {
+                continue;
+            }
+            throw ErrorReportException.report(
+                    ErrorCode.ERR_ACCESS_DENIED_FOR_EXTERNAL_ACCESS_CONTROLLER,
+                    PrivilegeType.SELECT.name(), ObjectType.TABLE.name(),
+                    " in Ranger-managed query: " + relation.getName() + " (" + table.getType() + ")");
         }
     }
 
@@ -276,6 +312,29 @@ public final class PreAnalyzerAuthorization {
             return;
         }
 
+        if (statement instanceof AlterMaterializedViewStmt alterMaterializedViewStmt) {
+            checkRangerManagedAlterMaterializedView(alterMaterializedViewStmt, session);
+            return;
+        }
+        if (statement instanceof AlterTableStmt alterTableStmt) {
+            if (alterTableStmt.getAlterClauseList().stream().anyMatch(AddRollupClause.class::isInstance)) {
+                checkRangerManagedStatement(
+                        session, PrivilegeType.ALTER, ObjectType.TABLE,
+                        "ALTER TABLE ADD ROLLUP");
+            }
+            return;
+        }
+        if (statement instanceof ExportStmt) {
+            checkRangerManagedStatement(
+                    session, PrivilegeType.EXPORT, ObjectType.TABLE, "EXPORT");
+            return;
+        }
+        if (statement instanceof RefreshMaterializedViewStatement) {
+            checkRangerManagedStatement(
+                    session, PrivilegeType.REFRESH, ObjectType.MATERIALIZED_VIEW,
+                    "REFRESH MATERIALIZED VIEW");
+            return;
+        }
         if (statement instanceof CreateViewStmt createViewStmt) {
             Authorizer.checkRangerManagedStoredDefinitionBeforeAnalysis(
                     createViewStmt.getQueryStatement(), session);
@@ -291,11 +350,17 @@ public final class PreAnalyzerAuthorization {
         if (statement instanceof CreateMaterializedViewStatement createMaterializedViewStatement) {
             Authorizer.checkRangerManagedStoredDefinitionBeforeAnalysis(
                     createMaterializedViewStatement.getQueryStatement(), session);
+            checkRangerManagedStatement(
+                    session, PrivilegeType.CREATE_MATERIALIZED_VIEW, ObjectType.DATABASE,
+                    "CREATE MATERIALIZED VIEW");
             return;
         }
         if (statement instanceof CreateMaterializedViewStmt createMaterializedViewStmt) {
             Authorizer.checkRangerManagedStoredDefinitionBeforeAnalysis(
                     createMaterializedViewStmt.getQueryStatement(), session);
+            checkRangerManagedStatement(
+                    session, PrivilegeType.CREATE_MATERIALIZED_VIEW, ObjectType.DATABASE,
+                    "CREATE MATERIALIZED VIEW");
             return;
         }
 
@@ -318,6 +383,36 @@ public final class PreAnalyzerAuthorization {
         if (queryStatement != null) {
             Authorizer.checkRangerManagedQueryBeforeAnalysis(queryStatement, session);
         }
+    }
+
+    private static void checkRangerManagedAlterMaterializedView(
+            AlterMaterializedViewStmt statement, ConnectContext session) {
+        if (statement.getAlterTableClause() instanceof AsyncRefreshSchemeDesc) {
+            checkRangerManagedStatement(
+                    session, PrivilegeType.ALTER, ObjectType.MATERIALIZED_VIEW,
+                    "ALTER MATERIALIZED VIEW REFRESH ASYNC");
+        } else if (statement.getAlterTableClause() instanceof IncrementalRefreshSchemeDesc) {
+            checkRangerManagedStatement(
+                    session, PrivilegeType.ALTER, ObjectType.MATERIALIZED_VIEW,
+                    "ALTER MATERIALIZED VIEW REFRESH INCREMENTAL");
+        } else if (statement.getAlterTableClause() instanceof AlterMaterializedViewStatusClause statusClause &&
+                AlterMaterializedViewStatusClause.ACTIVE.equalsIgnoreCase(statusClause.getStatus())) {
+            checkRangerManagedStatement(
+                    session, PrivilegeType.ALTER, ObjectType.MATERIALIZED_VIEW,
+                    "ALTER MATERIALIZED VIEW ACTIVE");
+        }
+    }
+
+    private static void checkRangerManagedStatement(
+            ConnectContext session, PrivilegeType privilegeType,
+            ObjectType objectType, String statementType) {
+        if (!Authorizer.isRangerManagedContext(session)) {
+            return;
+        }
+        throw ErrorReportException.report(
+                ErrorCode.ERR_ACCESS_DENIED_FOR_EXTERNAL_ACCESS_CONTROLLER,
+                privilegeType.name(), objectType.name(),
+                " in Ranger-managed statement: " + statementType);
     }
 
     private static void checkRangerManagedSubmitTaskQuery(

@@ -13,14 +13,22 @@
 // limitations under the License.
 package com.starrocks.authorization.ranger;
 
+import com.starrocks.analysis.CastExpr;
 import com.starrocks.analysis.Expr;
+import com.starrocks.analysis.SlotRef;
+import com.starrocks.analysis.TypeDef;
 import com.starrocks.authorization.AccessDeniedException;
 import com.starrocks.authorization.ExternalAccessController;
 import com.starrocks.authorization.PrivilegeType;
 import com.starrocks.catalog.Column;
+import com.starrocks.catalog.StructField;
+import com.starrocks.catalog.StructType;
+import com.starrocks.catalog.Type;
+import com.starrocks.common.util.SqlUtils;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.SqlModeHelper;
 import com.starrocks.sql.ast.UserIdentity;
+import com.starrocks.sql.parser.ParsingException;
 import com.starrocks.sql.parser.SqlParser;
 import org.apache.commons.lang.StringUtils;
 import org.apache.ranger.authorization.hadoop.config.RangerPluginConfig;
@@ -34,6 +42,7 @@ import org.apache.ranger.plugin.service.RangerBasePlugin;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 
@@ -42,6 +51,10 @@ import static java.util.Locale.ENGLISH;
 
 public abstract class RangerAccessController extends ExternalAccessController implements AccessTypeConverter {
     private static final Logger LOG = LoggerFactory.getLogger(RangerAccessController.class);
+    private static final String COLUMN_PLACEHOLDER = "{col}";
+    private static final String TYPE_PLACEHOLDER = "{type}";
+    private static final String COLUMN_SENTINEL_PREFIX = "__starrocks_ranger_mask_column_";
+    private static final String TYPE_SENTINEL_PREFIX = "__starrocks_ranger_mask_type_";
     protected final RangerBasePlugin rangerPlugin;
 
     public RangerAccessController(String serviceType, String serviceName) {
@@ -88,15 +101,65 @@ public abstract class RangerAccessController extends ExternalAccessController im
                 transformer = Objects.requireNonNullElse(maskedValue, "NULL");
             }
 
-            if (StringUtils.isNotEmpty(transformer)) {
-                transformer = transformer.replace("{col}", column.getName())
-                        .replace("{type}", column.getType().toSql());
-            }
-
-            return SqlParser.parseSqlToExpr(transformer, SqlModeHelper.MODE_DEFAULT);
+            return parseColumnMaskTransformer(transformer, column);
         }
 
         return null;
+    }
+
+    private static Expr parseColumnMaskTransformer(String transformer, Column column) {
+        int columnPlaceholderCount = StringUtils.countMatches(transformer, COLUMN_PLACEHOLDER);
+        int typePlaceholderCount = StringUtils.countMatches(transformer, TYPE_PLACEHOLDER);
+        String columnSentinel = findUnusedIdentifier(transformer, COLUMN_SENTINEL_PREFIX);
+        String typeSentinel = findUnusedIdentifier(transformer, TYPE_SENTINEL_PREFIX);
+        Type typeSentinelType = new StructType(List.of(new StructField(typeSentinel, Type.BIGINT)), true);
+
+        String transformerWithSentinels = transformer
+                .replace(COLUMN_PLACEHOLDER, columnSentinel)
+                .replace(TYPE_PLACEHOLDER, typeSentinelType.toSql());
+        Expr expression = SqlParser.parseSqlToExpr(transformerWithSentinels, SqlModeHelper.MODE_DEFAULT);
+
+        int[] boundPlaceholderCounts = new int[2];
+        expression = bindColumnMaskPlaceholders(
+                expression, columnSentinel, typeSentinelType, column, boundPlaceholderCounts);
+        if (boundPlaceholderCounts[0] != columnPlaceholderCount ||
+                boundPlaceholderCounts[1] != typePlaceholderCount) {
+            throw new ParsingException("Ranger column mask placeholder must be used in its exact expression context");
+        }
+        return expression;
+    }
+
+    private static Expr bindColumnMaskPlaceholders(Expr expression, String columnSentinel, Type typeSentinel,
+                                                   Column column, int[] boundPlaceholderCounts) {
+        if (expression instanceof SlotRef slotRef &&
+                columnSentinel.equals(slotRef.getColumnName()) &&
+                slotRef.getTblNameWithoutAnalyzed() == null) {
+            boundPlaceholderCounts[0]++;
+            return new SlotRef(null, column.getName(), SqlUtils.getIdentSql(column.getName()));
+        }
+
+        for (int i = 0; i < expression.getChildren().size(); i++) {
+            expression.setChild(i, bindColumnMaskPlaceholders(
+                    expression.getChild(i), columnSentinel, typeSentinel, column, boundPlaceholderCounts));
+        }
+
+        if (expression instanceof CastExpr castExpr) {
+            TypeDef targetTypeDef = castExpr.getTargetTypeDef();
+            if (targetTypeDef != null && typeSentinel.equals(targetTypeDef.getType())) {
+                targetTypeDef.setType(column.getType());
+                boundPlaceholderCounts[1]++;
+            }
+        }
+        return expression;
+    }
+
+    private static String findUnusedIdentifier(String transformer, String prefix) {
+        for (int suffix = 0; ; suffix++) {
+            String candidate = prefix + suffix;
+            if (!transformer.contains(candidate)) {
+                return candidate;
+            }
+        }
     }
 
     protected Expr getRowAccessExpression(RangerAccessResourceImpl resource, ConnectContext context) {
