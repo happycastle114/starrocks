@@ -17,11 +17,14 @@ package com.starrocks.mysql;
 import com.starrocks.authentication.AuthenticationException;
 import com.starrocks.authentication.AuthenticationHandler;
 import com.starrocks.authentication.AuthenticationMgr;
+import com.starrocks.authentication.OAuth2Context;
+import com.starrocks.authentication.UserAuthenticationInfo;
 import com.starrocks.authorization.AccessDeniedException;
 import com.starrocks.authorization.MockedLocalMetaStore;
 import com.starrocks.authorization.RBACMockedMetadataMgr;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.Pair;
+import com.starrocks.mysql.privilege.AuthPlugin;
 import com.starrocks.persist.EditLog;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.ConnectScheduler;
@@ -44,8 +47,10 @@ import org.mockito.Mockito;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -60,6 +65,13 @@ import static org.mockito.Mockito.spy;
  */
 public class MysqlProtoChangeUserTest {
     private static final String MANAGED_USER = "flight_sql_ci";
+    private static final String JWT_USER = "jwt_user";
+    private static final String OAUTH2_USER = "oauth2_user";
+    private static final String ORIGINAL_AUTH_TOKEN = "original-auth-token";
+    private static final String TARGET_AUTH_TOKEN = "target-auth-token";
+    private static final String ORIGINAL_AUTH_PLUGIN = "original-auth-plugin";
+    private static final OAuth2Context ORIGINAL_OAUTH2_CONTEXT = createOAuth2Context("original");
+    private static final OAuth2Context TARGET_OAUTH2_CONTEXT = createOAuth2Context("target");
 
     private ConnectContext context;
     private AuthenticationMgr authMgr;
@@ -123,6 +135,16 @@ public class MysqlProtoChangeUserTest {
                         " identified with mysql_native_password by 'managed_password'", 32).get(0);
         Analyzer.analyze(createManagedUser, context);
         authMgr.createUser(createManagedUser);
+
+        CreateUserStmt createJwtUser = (CreateUserStmt) SqlParser
+                .parse("create user " + JWT_USER + " identified with authentication_jwt", 32).get(0);
+        Analyzer.analyze(createJwtUser, context);
+        authMgr.createUser(createJwtUser);
+
+        CreateUserStmt createOAuth2User = (CreateUserStmt) SqlParser
+                .parse("create user " + OAUTH2_USER + " identified with authentication_oauth2", 32).get(0);
+        Analyzer.analyze(createOAuth2User, context);
+        authMgr.createUser(createOAuth2User);
     }
 
     /**
@@ -130,17 +152,146 @@ public class MysqlProtoChangeUserTest {
      */
     @Test
     public void testChangeUserInvalidPacket() throws IOException {
-        // Create invalid packet (wrong command code)
-        ByteBuffer invalidPacket = ByteBuffer.allocate(10);
-        invalidPacket.put((byte) 0x01); // Wrong command code
-        invalidPacket.put("test".getBytes(StandardCharsets.UTF_8));
-        invalidPacket.flip();
-        
-        // Execute change user
-        boolean result = MysqlProto.changeUser(context, invalidPacket);
-        
-        // Verify failure
-        Assertions.assertFalse(result, "Change user should fail with invalid packet");
+        AuthenticationStateSnapshot previousState = AuthenticationStateSnapshot.capture(context);
+        ByteBuffer truncatedUser = ByteBuffer.wrap(new byte[] {
+                (byte) MysqlCommand.COM_CHANGE_USER.getCommandCode(), 'u'
+        });
+
+        Assertions.assertFalse(MysqlProto.changeUser(context, truncatedUser));
+        previousState.assertRestored(context);
+        Assertions.assertEquals(ErrorCode.ERR_NOT_SUPPORTED_AUTH_MODE, context.getState().getErrorCode());
+    }
+
+    @Test
+    public void testChangeUserPacketSecureAuthResponseUsesOneByteLengthAtBoundaries() {
+        Assertions.assertTrue(MysqlCapability.DEFAULT_CAPABILITY.isPluginAuthDataLengthEncoded());
+        for (int authResponseLength : new int[] {250, 251, 255}) {
+            byte[] authResponse = new byte[authResponseLength];
+            Arrays.fill(authResponse, (byte) 1);
+            ByteBuffer buffer = createChangeUserPacket(
+                    "user1", authResponse, null, AuthPlugin.Client.MYSQL_NATIVE_PASSWORD.toString());
+            MysqlChangeUserPacket packet = new MysqlChangeUserPacket(MysqlCapability.DEFAULT_CAPABILITY);
+
+            Assertions.assertTrue(packet.readFrom(buffer), "length=" + authResponseLength);
+            Assertions.assertArrayEquals(authResponse, packet.getAuthResponse(), "length=" + authResponseLength);
+        }
+    }
+
+    @Test
+    public void testChangeUserPacketRejectsTruncatedSecureAuthResponse() {
+        MysqlSerializer serializer = MysqlSerializer.newInstance();
+        serializer.writeInt1(MysqlCommand.COM_CHANGE_USER.getCommandCode());
+        serializer.writeNulTerminateString("user1");
+        serializer.writeInt1(255);
+        serializer.writeBytes(new byte[254]);
+
+        MysqlChangeUserPacket packet = new MysqlChangeUserPacket(MysqlCapability.DEFAULT_CAPABILITY);
+        Assertions.assertFalse(packet.readFrom(serializer.toByteBuffer()));
+    }
+
+    @Test
+    public void testChangeUserPacketRejectsMalformedTrailingFields() {
+        MysqlSerializer missingDatabaseTerminator = createChangeUserPacketPrefix();
+        missingDatabaseTerminator.writeEofString("db");
+        assertMalformedChangeUserPacket(missingDatabaseTerminator, "database terminator");
+
+        MysqlSerializer truncatedCharacterSet = createChangeUserPacketPrefix();
+        truncatedCharacterSet.writeNulTerminateString("db");
+        truncatedCharacterSet.writeInt1(33);
+        assertMalformedChangeUserPacket(truncatedCharacterSet, "character set");
+
+        MysqlSerializer missingPluginTerminator = createChangeUserPacketThroughCharacterSet();
+        missingPluginTerminator.writeEofString(AuthPlugin.Client.MYSQL_NATIVE_PASSWORD.toString());
+        assertMalformedChangeUserPacket(missingPluginTerminator, "plugin terminator");
+
+        MysqlSerializer unsupportedAttributeLength = createChangeUserPacketThroughPlugin();
+        unsupportedAttributeLength.writeInt1(255);
+        assertMalformedChangeUserPacket(unsupportedAttributeLength, "attribute length prefix");
+
+        MysqlSerializer unsupportedAttributeKeyLength = createChangeUserPacketThroughPlugin();
+        unsupportedAttributeKeyLength.writeInt1(2);
+        unsupportedAttributeKeyLength.writeInt1(255);
+        unsupportedAttributeKeyLength.writeInt1(0);
+        assertMalformedChangeUserPacket(unsupportedAttributeKeyLength, "attribute key length prefix");
+
+        MysqlSerializer truncatedAttributePair = createChangeUserPacketThroughPlugin();
+        truncatedAttributePair.writeInt1(1);
+        truncatedAttributePair.writeInt1(0);
+        assertMalformedChangeUserPacket(truncatedAttributePair, "attribute pair");
+
+        MysqlSerializer trailingData = createChangeUserPacketThroughPlugin();
+        trailingData.writeInt1(0);
+        trailingData.writeInt1(0);
+        assertMalformedChangeUserPacket(trailingData, "trailing data");
+    }
+
+    @Test
+    public void testChangeUserPacketAcceptsFullyConsumedConnectAttributes() {
+        MysqlSerializer serializer = createChangeUserPacketThroughPlugin();
+        serializer.writeInt1(4);
+        serializer.writeInt1(1);
+        serializer.writeInt1('k');
+        serializer.writeInt1(1);
+        serializer.writeInt1('v');
+        MysqlChangeUserPacket packet = new MysqlChangeUserPacket(MysqlCapability.DEFAULT_CAPABILITY);
+
+        Assertions.assertTrue(packet.readFrom(serializer.toByteBuffer()));
+        Assertions.assertEquals(Map.of("k", "v"), packet.getConnectAttributes());
+    }
+
+    @Test
+    public void testChangeUserRejectsMissingEmptyOrMismatchedTargetPlugin() throws IOException {
+        AuthenticationStateSnapshot previousState = setDistinctAuthenticationState();
+        byte[] authResponse = "jwt-token".getBytes(StandardCharsets.UTF_8);
+
+        try (MockedStatic<AuthenticationHandler> authentication = Mockito.mockStatic(AuthenticationHandler.class)) {
+            for (String pluginName : new String[] {
+                    null, "", AuthPlugin.Client.MYSQL_NATIVE_PASSWORD.toString()
+            }) {
+                context.getState().reset();
+                ByteBuffer changeUserPacket = createChangeUserPacket(
+                        JWT_USER, authResponse, null, pluginName);
+
+                Assertions.assertFalse(MysqlProto.changeUser(context, changeUserPacket));
+                previousState.assertRestored(context);
+                Assertions.assertEquals(ErrorCode.ERR_AUTHENTICATION_FAIL, context.getState().getErrorCode());
+            }
+            authentication.verifyNoInteractions();
+        }
+    }
+
+    @Test
+    public void testChangeUserRejectsOAuth2TargetWithoutReusingSourceToken() throws IOException {
+        AuthenticationStateSnapshot previousState = setDistinctAuthenticationState();
+        ByteBuffer changeUserPacket = createChangeUserPacket(
+                OAUTH2_USER, "oauth-response".getBytes(StandardCharsets.UTF_8), null,
+                AuthPlugin.Client.AUTHENTICATION_OAUTH2_CLIENT.toString());
+
+        try (MockedStatic<AuthenticationHandler> authentication = Mockito.mockStatic(AuthenticationHandler.class)) {
+            Assertions.assertFalse(MysqlProto.changeUser(context, changeUserPacket));
+            authentication.verifyNoInteractions();
+        }
+
+        previousState.assertRestored(context);
+        Assertions.assertEquals(ORIGINAL_AUTH_TOKEN, context.getAuthToken());
+        Assertions.assertSame(ORIGINAL_OAUTH2_CONTEXT, context.getOAuth2Context());
+        Assertions.assertEquals(ErrorCode.ERR_AUTHENTICATION_FAIL, context.getState().getErrorCode());
+    }
+
+    @Test
+    public void testChangeUserRejectsActiveExplicitTransactionWithoutChangingSourceState() throws IOException {
+        AuthenticationStateSnapshot previousState = setDistinctAuthenticationState();
+        context.setTxnId(1234L);
+        ByteBuffer changeUserPacket = createChangeUserPacket("user1", "password1", null);
+
+        try (MockedStatic<AuthenticationHandler> authentication = Mockito.mockStatic(AuthenticationHandler.class)) {
+            Assertions.assertFalse(MysqlProto.changeUser(context, changeUserPacket));
+            authentication.verifyNoInteractions();
+        }
+
+        previousState.assertRestored(context);
+        Assertions.assertEquals(1234L, context.getTxnId());
+        Assertions.assertEquals(ErrorCode.ERR_UNKNOWN_ERROR, context.getState().getErrorCode());
     }
 
     /**
@@ -196,6 +347,9 @@ public class MysqlProtoChangeUserTest {
         context.setGroups(null);
         context.setSecurityIntegration(null);
         context.setDistinguishedName(null);
+        context.setAuthToken(null);
+        context.setOAuth2Context(null);
+        context.setAuthPlugin(null);
         AuthenticationStateSnapshot previousState = AuthenticationStateSnapshot.capture(context);
         ByteBuffer changeUserPacket = createChangeUserPacket("user1", "password1", null);
 
@@ -242,10 +396,19 @@ public class MysqlProtoChangeUserTest {
         AuthenticationStateSnapshot previousState = setDistinctAuthenticationState();
         context.getSessionVariable().setResourceGroup("ordinary-resource-group");
         context.getSessionVariable().setQueryTimeoutS(41);
-        authMgr.updateUserProperty(MANAGED_USER, List.of(Pair.create("session.query_timeout", "321")));
         ByteBuffer changeUserPacket = createChangeUserPacket(MANAGED_USER, "managed_password", null);
 
-        try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class)) {
+        try (MockedStatic<AuthenticationHandler> authentication = Mockito.mockStatic(AuthenticationHandler.class);
+                MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class)) {
+            authentication.when(() -> AuthenticationHandler.authenticate(
+                            any(ConnectContext.class), any(String.class), any(String.class), any(byte[].class)))
+                    .thenAnswer(invocation -> {
+                        installAuthenticatedTarget(context, MANAGED_USER,
+                                AuthPlugin.Client.MYSQL_NATIVE_PASSWORD.toString(), TARGET_AUTH_TOKEN);
+                        context.getSessionVariable().setResourceGroup("target-resource-group");
+                        context.getSessionVariable().setQueryTimeoutS(321);
+                        return context.getCurrentUserIdentity();
+                    });
             authorizer.when(() -> Authorizer.isRangerManagedContext(context))
                     .thenAnswer(invocation -> MANAGED_USER.equals(context.getQualifiedUser()));
 
@@ -257,6 +420,113 @@ public class MysqlProtoChangeUserTest {
         Assertions.assertEquals(41, context.getSessionVariable().getQueryTimeoutS());
         Assertions.assertEquals(ErrorCode.ERR_ACCESS_DENIED_FOR_EXTERNAL_ACCESS_CONTROLLER,
                 context.getState().getErrorCode());
+    }
+
+    @Test
+    public void testChangeUserSuccessRetainsTargetAuthenticationState() throws IOException {
+        setDistinctAuthenticationState();
+        String targetPlugin = AuthPlugin.Client.AUTHENTICATION_OPENID_CONNECT_CLIENT.toString();
+        ByteBuffer changeUserPacket = createChangeUserPacket(
+                JWT_USER, "jwt-token".getBytes(StandardCharsets.UTF_8), null, targetPlugin);
+
+        new MockUp<ConnectScheduler>() {
+            @Mock
+            public Pair<Boolean, String> onUserChanged(
+                    ConnectContext context, String previousUser, String newUser) {
+                return Pair.create(true, "");
+            }
+        };
+        new MockUp<ExecuteEnv>() {
+            @Mock
+            public ConnectScheduler getScheduler() {
+                return new ConnectScheduler(1000);
+            }
+        };
+
+        try (MockedStatic<AuthenticationHandler> authentication = Mockito.mockStatic(AuthenticationHandler.class);
+                MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class)) {
+            authentication.when(() -> AuthenticationHandler.authenticate(
+                            any(ConnectContext.class), any(String.class), any(String.class), any(byte[].class)))
+                    .thenAnswer(invocation -> {
+                        Assertions.assertNull(context.getCurrentUserIdentity());
+                        Assertions.assertNull(context.getQualifiedUser());
+                        Assertions.assertNull(context.getCurrentRoleIds());
+                        Assertions.assertNull(context.getGroups());
+                        Assertions.assertNull(context.getSecurityIntegration());
+                        Assertions.assertEquals("", context.getDistinguishedName());
+                        Assertions.assertNull(context.getAuthToken());
+                        Assertions.assertNull(context.getOAuth2Context());
+                        Assertions.assertEquals(targetPlugin, context.getAuthPlugin());
+                        return installAuthenticatedTarget(context, JWT_USER, targetPlugin, TARGET_AUTH_TOKEN);
+                    });
+            authorizer.when(() -> Authorizer.isRangerManagedContext(context)).thenReturn(false);
+
+            Assertions.assertTrue(MysqlProto.changeUser(context, changeUserPacket));
+        }
+
+        Assertions.assertEquals(JWT_USER, context.getQualifiedUser());
+        Assertions.assertEquals(
+                authMgr.getBestMatchedUserIdentity(JWT_USER, "127.0.0.1").getKey(),
+                context.getCurrentUserIdentity());
+        Assertions.assertEquals(context.getCurrentUserIdentity(), context.getAuthenticatedUserIdentity());
+        Assertions.assertEquals(TARGET_AUTH_TOKEN, context.getAuthToken());
+        Assertions.assertNull(context.getOAuth2Context());
+        Assertions.assertEquals(targetPlugin, context.getAuthPlugin());
+    }
+
+    @Test
+    public void testChangeUserRejectsConcurrentTargetPluginChange() throws Exception {
+        AuthenticationStateSnapshot previousState = setDistinctAuthenticationState();
+        String targetPlugin = AuthPlugin.Client.AUTHENTICATION_OPENID_CONNECT_CLIENT.toString();
+        ByteBuffer changeUserPacket = createChangeUserPacket(
+                JWT_USER, "jwt-token".getBytes(StandardCharsets.UTF_8), null, targetPlugin);
+
+        try (MockedStatic<AuthenticationHandler> authentication = Mockito.mockStatic(AuthenticationHandler.class);
+                MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class)) {
+            authentication.when(() -> AuthenticationHandler.authenticate(
+                            any(ConnectContext.class), any(String.class), any(String.class), any(byte[].class)))
+                    .thenAnswer(invocation -> {
+                        UserIdentity targetIdentity = authMgr
+                                .getBestMatchedUserIdentity(JWT_USER, "127.0.0.1").getKey();
+                        authMgr.alterUser(targetIdentity, createAuthenticationInfo(
+                                targetIdentity, AuthPlugin.Server.AUTHENTICATION_OAUTH2.toString(),
+                                MysqlPassword.EMPTY_PASSWORD, null), null);
+                        return installAuthenticatedTarget(context, JWT_USER, targetPlugin, TARGET_AUTH_TOKEN);
+                    });
+            authorizer.when(() -> Authorizer.isRangerManagedContext(context)).thenReturn(false);
+
+            Assertions.assertFalse(MysqlProto.changeUser(context, changeUserPacket));
+        }
+
+        previousState.assertRestored(context);
+        Assertions.assertEquals(ErrorCode.ERR_AUTHENTICATION_FAIL, context.getState().getErrorCode());
+    }
+
+    @Test
+    public void testChangeUserRejectsConcurrentTargetCredentialChange() throws Exception {
+        AuthenticationStateSnapshot previousState = setDistinctAuthenticationState();
+        String targetPlugin = AuthPlugin.Client.MYSQL_NATIVE_PASSWORD.toString();
+        ByteBuffer changeUserPacket = createChangeUserPacket("user1", "password1", null);
+
+        try (MockedStatic<AuthenticationHandler> authentication = Mockito.mockStatic(AuthenticationHandler.class);
+                MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class)) {
+            authentication.when(() -> AuthenticationHandler.authenticate(
+                            any(ConnectContext.class), any(String.class), any(String.class), any(byte[].class)))
+                    .thenAnswer(invocation -> {
+                        UserIdentity targetIdentity = authMgr
+                                .getBestMatchedUserIdentity("user1", "127.0.0.1").getKey();
+                        authMgr.alterUser(targetIdentity, createAuthenticationInfo(
+                                targetIdentity, AuthPlugin.Server.MYSQL_NATIVE_PASSWORD.toString(),
+                                MysqlPassword.makeScrambledPassword("rotated-password"), null), null);
+                        return installAuthenticatedTarget(context, "user1", targetPlugin, TARGET_AUTH_TOKEN);
+                    });
+            authorizer.when(() -> Authorizer.isRangerManagedContext(context)).thenReturn(false);
+
+            Assertions.assertFalse(MysqlProto.changeUser(context, changeUserPacket));
+        }
+
+        previousState.assertRestored(context);
+        Assertions.assertEquals(ErrorCode.ERR_AUTHENTICATION_FAIL, context.getState().getErrorCode());
     }
 
     /**
@@ -519,6 +789,14 @@ public class MysqlProtoChangeUserTest {
      * Helper method to create a change user packet
      */
     private ByteBuffer createChangeUserPacket(String username, String password, String database) {
+        byte[] authResponse = password.isEmpty()
+                ? MysqlPassword.EMPTY_PASSWORD : password.getBytes(StandardCharsets.UTF_8);
+        return createChangeUserPacket(
+                username, authResponse, database, AuthPlugin.Client.MYSQL_NATIVE_PASSWORD.toString());
+    }
+
+    private ByteBuffer createChangeUserPacket(
+            String username, byte[] authResponse, String database, String pluginName) {
         MysqlSerializer serializer = MysqlSerializer.newInstance();
         
         // Command code for COM_CHANGE_USER
@@ -527,15 +805,6 @@ public class MysqlProtoChangeUserTest {
         // Username
         serializer.writeNulTerminateString(username);
         
-        // Auth response (password)
-        byte[] authResponse;
-        if (password.isEmpty()) {
-            authResponse = MysqlPassword.EMPTY_PASSWORD;
-        } else {
-            // For testing, we'll use the password directly as auth response
-            // In real scenario, this would be scrambled
-            authResponse = password.getBytes(StandardCharsets.UTF_8);
-        }
         serializer.writeInt1(authResponse.length);
         serializer.writeBytes(authResponse);
         
@@ -549,10 +818,37 @@ public class MysqlProtoChangeUserTest {
         // Character set
         serializer.writeInt2(33); // UTF8
         
-        // Plugin name (empty for mysql_native_password)
-        serializer.writeNulTerminateString("");
+        if (pluginName != null) {
+            serializer.writeNulTerminateString(pluginName);
+        }
         
         return serializer.toByteBuffer();
+    }
+
+    private static MysqlSerializer createChangeUserPacketPrefix() {
+        MysqlSerializer serializer = MysqlSerializer.newInstance();
+        serializer.writeInt1(MysqlCommand.COM_CHANGE_USER.getCommandCode());
+        serializer.writeNulTerminateString("user1");
+        serializer.writeInt1(0);
+        return serializer;
+    }
+
+    private static MysqlSerializer createChangeUserPacketThroughCharacterSet() {
+        MysqlSerializer serializer = createChangeUserPacketPrefix();
+        serializer.writeNulTerminateString("");
+        serializer.writeInt2(33);
+        return serializer;
+    }
+
+    private static MysqlSerializer createChangeUserPacketThroughPlugin() {
+        MysqlSerializer serializer = createChangeUserPacketThroughCharacterSet();
+        serializer.writeNulTerminateString(AuthPlugin.Client.MYSQL_NATIVE_PASSWORD.toString());
+        return serializer;
+    }
+
+    private static void assertMalformedChangeUserPacket(MysqlSerializer serializer, String field) {
+        MysqlChangeUserPacket packet = new MysqlChangeUserPacket(MysqlCapability.DEFAULT_CAPABILITY);
+        Assertions.assertFalse(packet.readFrom(serializer.toByteBuffer()), field);
     }
 
     private AuthenticationStateSnapshot setDistinctAuthenticationState() {
@@ -560,26 +856,71 @@ public class MysqlProtoChangeUserTest {
         context.setGroups(new HashSet<>(Set.of("original-group")));
         context.setSecurityIntegration("original-security-integration");
         context.setDistinguishedName("original-distinguished-name");
+        context.setAuthToken(ORIGINAL_AUTH_TOKEN);
+        context.setOAuth2Context(ORIGINAL_OAUTH2_CONTEXT);
+        context.setAuthPlugin(ORIGINAL_AUTH_PLUGIN);
         return AuthenticationStateSnapshot.capture(context);
     }
 
     private static void mutateAuthenticationState(ConnectContext context) {
-        context.setCurrentUserIdentity(new UserIdentity("changed-user", "changed-host"));
-        context.setQualifiedUser("changed-user");
+        mutateAuthenticationState(context, "changed-user");
+    }
+
+    private static void mutateAuthenticationState(ConnectContext context, String user) {
+        context.setCurrentUserIdentity(new UserIdentity(user, "changed-host"));
+        context.setQualifiedUser(user);
         context.setCurrentRoleIds(new HashSet<>(Set.of(999L)));
         context.setGroups(new HashSet<>(Set.of("changed-group")));
         context.setSecurityIntegration("changed-security-integration");
         context.setDistinguishedName("changed-distinguished-name");
+        context.setAuthToken(TARGET_AUTH_TOKEN);
+        context.setOAuth2Context(TARGET_OAUTH2_CONTEXT);
+        context.setAuthPlugin("changed-auth-plugin");
+    }
+
+    private UserIdentity installAuthenticatedTarget(
+            ConnectContext targetContext, String user, String clientPlugin, String authToken) {
+        UserIdentity matchedIdentity = authMgr.getBestMatchedUserIdentity(user, "127.0.0.1").getKey();
+        targetContext.setCurrentUserIdentity(matchedIdentity);
+        targetContext.setQualifiedUser(user);
+        targetContext.setCurrentRoleIds(new HashSet<>(Set.of(999L)));
+        targetContext.setGroups(new HashSet<>(Set.of("target-group")));
+        targetContext.setSecurityIntegration("native");
+        targetContext.setDistinguishedName("target-distinguished-name");
+        targetContext.setAuthToken(authToken);
+        targetContext.setOAuth2Context(null);
+        targetContext.setAuthPlugin(clientPlugin);
+        return matchedIdentity;
+    }
+
+    private static UserAuthenticationInfo createAuthenticationInfo(
+            UserIdentity userIdentity, String serverPlugin, byte[] password, String authString)
+            throws AuthenticationException {
+        UserAuthenticationInfo authenticationInfo = new UserAuthenticationInfo();
+        authenticationInfo.setAuthPlugin(serverPlugin);
+        authenticationInfo.setPassword(password);
+        authenticationInfo.setAuthString(authString);
+        authenticationInfo.setOrigUserHost(userIdentity.getUser(), userIdentity.getHost());
+        return authenticationInfo;
+    }
+
+    private static OAuth2Context createOAuth2Context(String prefix) {
+        return new OAuth2Context(
+                prefix + "-auth-server-url", prefix + "-token-server-url", prefix + "-redirect-url",
+                prefix + "-client-id", prefix + "-client-secret", prefix + "-jwks-url", prefix + "-principal-field",
+                new String[] {prefix + "-issuer"}, new String[] {prefix + "-audience"}, 30L);
     }
 
     private record AuthenticationStateSnapshot(UserIdentity currentUserIdentity, String qualifiedUser,
                                                Set<Long> currentRoleIds, Set<String> groups,
-                                               String securityIntegration, String distinguishedName) {
+                                               String securityIntegration, String distinguishedName,
+                                               String authToken, OAuth2Context oAuth2Context, String authPlugin) {
         private static AuthenticationStateSnapshot capture(ConnectContext context) {
             return new AuthenticationStateSnapshot(
                     context.getCurrentUserIdentity(), context.getQualifiedUser(),
                     copySet(context.getCurrentRoleIds()), copySet(context.getGroups()),
-                    context.getSecurityIntegration(), context.getDistinguishedName());
+                    context.getSecurityIntegration(), context.getDistinguishedName(),
+                    context.getAuthToken(), context.getOAuth2Context(), context.getAuthPlugin());
         }
 
         private void assertRestored(ConnectContext context) {
@@ -589,6 +930,9 @@ public class MysqlProtoChangeUserTest {
             Assertions.assertEquals(groups, context.getGroups());
             Assertions.assertEquals(securityIntegration, context.getSecurityIntegration());
             Assertions.assertEquals(distinguishedName, context.getDistinguishedName());
+            Assertions.assertEquals(authToken, context.getAuthToken());
+            Assertions.assertSame(oAuth2Context, context.getOAuth2Context());
+            Assertions.assertEquals(authPlugin, context.getAuthPlugin());
         }
 
         private static <T> Set<T> copySet(Set<T> values) {

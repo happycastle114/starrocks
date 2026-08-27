@@ -39,6 +39,7 @@ import com.starrocks.authentication.AuthenticationException;
 import com.starrocks.authentication.AuthenticationHandler;
 import com.starrocks.authentication.AuthenticationProvider;
 import com.starrocks.authentication.AuthenticationProviderFactory;
+import com.starrocks.authentication.OAuth2Context;
 import com.starrocks.authentication.SecurityIntegration;
 import com.starrocks.authentication.UserAuthenticationInfo;
 import com.starrocks.common.Config;
@@ -61,8 +62,10 @@ import org.apache.logging.log4j.Logger;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 // MySQL protocol util
@@ -201,6 +204,7 @@ public class MysqlProto {
             }
         }
 
+        context.captureAuthenticatedIdentity();
         return new NegotiateResult(authPacket, NegotiateState.OK);
     }
 
@@ -229,10 +233,14 @@ public class MysqlProto {
         // parse change user packet
         MysqlChangeUserPacket changeUserPacket = new MysqlChangeUserPacket(context.getCapability());
         if (!changeUserPacket.readFrom(buffer)) {
-            ErrorReport.report(ErrorCode.ERR_NOT_SUPPORTED_AUTH_MODE);
-            sendResponsePacket(context);
-            // reconstruct serializer with context capability
-            context.getSerializer().setCapability(context.getCapability());
+            context.getState().setErrorCode(ErrorCode.ERR_NOT_SUPPORTED_AUTH_MODE);
+            context.getState().setError(ErrorCode.ERR_NOT_SUPPORTED_AUTH_MODE.formatErrorMsg());
+            return false;
+        }
+        if (context.getTxnId() != 0) {
+            context.getState().setErrorCode(ErrorCode.ERR_UNKNOWN_ERROR);
+            context.getState().setError(
+                    "COM_CHANGE_USER is not allowed while an explicit transaction is active");
             return false;
         }
         // save previous user login info
@@ -252,16 +260,20 @@ public class MysqlProto {
         // do authenticate again
 
         try {
-            AuthenticationHandler.authenticate(context, changeUserPacket.getUser(), context.getMysqlChannel().getRemoteIp(),
-                    changeUserPacket.getAuthResponse());
+            authenticateChangeUser(context, changeUserPacket);
         } catch (AuthenticationException e) {
             LOG.warn("Command `Change user` failed, from [{}] to [{}]. ", previousQualifiedUser,
                     changeUserPacket.getUser());
-            previousAuthenticationState.restore(context);
-            context.setSessionVariable(previousSessionVariable);
-            sendResponsePacket(context);
-            // reconstruct serializer with context capability
-            context.getSerializer().setCapability(context.getCapability());
+            restoreChangeUserState(context, previousAuthenticationState, previousSessionVariable,
+                    previousCatalog, previousDb);
+            setAuthenticationError(context, e);
+            return false;
+        } catch (RuntimeException e) {
+            LOG.warn("Command `Change user` failed unexpectedly, from [{}] to [{}].",
+                    previousQualifiedUser, changeUserPacket.getUser(), e);
+            restoreChangeUserState(context, previousAuthenticationState, previousSessionVariable,
+                    previousCatalog, previousDb);
+            setAuthenticationError(context, authenticationFailure(changeUserPacket));
             return false;
         }
         try {
@@ -283,38 +295,153 @@ public class MysqlProto {
             } catch (Exception e) {
                 LOG.warn("Command `Change user` failed at stage changing db, from [{}] to [{}], err[{}] ",
                         previousQualifiedUser, changeUserPacket.getUser(), e.getMessage(), e);
+                restoreChangeUserState(context, previousAuthenticationState, previousSessionVariable,
+                        previousCatalog, previousDb);
                 if (!context.getState().isError()) {
                     context.getState().setError(e.getMessage());
                 }
-                context.setCurrentCatalog(previousCatalog);
-                context.setDatabase(previousDb);
-                // recover from previous user login info
-                context.setSessionVariable(previousSessionVariable);
-                previousAuthenticationState.restore(context);
-                sendResponsePacket(context);
-                // reconstruct serializer with context capability
-                context.getSerializer().setCapability(context.getCapability());
                 return false;
             }
         }
-        ConnectScheduler connectScheduler = ExecuteEnv.getInstance().getScheduler();
-        Pair<Boolean, String> userChangeResult = connectScheduler.onUserChanged(
-                context, previousQualifiedUser, context.getQualifiedUser());
+        Pair<Boolean, String> userChangeResult;
+        try {
+            ConnectScheduler connectScheduler = ExecuteEnv.getInstance().getScheduler();
+            userChangeResult = connectScheduler.onUserChanged(
+                    context, previousQualifiedUser, context.getQualifiedUser());
+        } catch (RuntimeException e) {
+            LOG.warn("Command `Change user` failed at stage updating scheduler, from [{}] to [{}].",
+                    previousQualifiedUser, changeUserPacket.getUser(), e);
+            restoreChangeUserState(context, previousAuthenticationState, previousSessionVariable,
+                    previousCatalog, previousDb);
+            context.getState().setErrorCode(ErrorCode.ERR_UNKNOWN_ERROR);
+            context.getState().setError("Failed to change user");
+            return false;
+        }
         if (!userChangeResult.first) {
+            restoreChangeUserState(context, previousAuthenticationState, previousSessionVariable,
+                    previousCatalog, previousDb);
             context.getState().setErrorCode(ErrorCode.ERR_TOO_MANY_USER_CONNECTIONS);
             context.getState().setError(userChangeResult.second);
-            context.setSessionVariable(previousSessionVariable);
-            previousAuthenticationState.restore(context);
-            context.setCurrentCatalog(previousCatalog);
-            context.setDatabase(previousDb);
-            sendResponsePacket(context);
-            context.getSerializer().setCapability(context.getCapability());
             return false;
         }
 
+        context.captureAuthenticatedIdentity();
         LOG.info("Command `Change user` succeeded, from [{}] to [{}]. ", previousQualifiedUser,
                 context.getQualifiedUser());
         return true;
+    }
+
+    private static void authenticateChangeUser(ConnectContext context, MysqlChangeUserPacket changeUserPacket)
+            throws AuthenticationException {
+        String remoteIp = context.getMysqlChannel().getRemoteIp();
+        ChangeUserTarget initialTarget = ChangeUserTarget.capture(GlobalStateMgr.getCurrentState()
+                .getAuthenticationMgr().getBestMatchedUserIdentity(changeUserPacket.getUser(), remoteIp));
+        if (!isSupportedChangeUserTarget(initialTarget, changeUserPacket)) {
+            throw authenticationFailure(changeUserPacket);
+        }
+
+        String serverPlugin = initialTarget.serverPlugin();
+        String clientPlugin = AuthPlugin.covertFromServerToClient(serverPlugin);
+        String packetPlugin = changeUserPacket.getPluginName();
+        if (packetPlugin == null) {
+            if (!AuthPlugin.Client.MYSQL_NATIVE_PASSWORD.toString().equalsIgnoreCase(clientPlugin)) {
+                throw authenticationFailure(changeUserPacket);
+            }
+        } else if (!clientPlugin.equalsIgnoreCase(packetPlugin)) {
+            throw authenticationFailure(changeUserPacket);
+        }
+
+        clearAuthenticationStateForChangeUser(context, clientPlugin);
+        UserIdentity authenticatedUser = AuthenticationHandler.authenticate(
+                context, changeUserPacket.getUser(), remoteIp, changeUserPacket.getAuthResponse());
+        ChangeUserTarget currentTarget = ChangeUserTarget.capture(GlobalStateMgr.getCurrentState()
+                .getAuthenticationMgr().getBestMatchedUserIdentity(changeUserPacket.getUser(), remoteIp));
+        if (!isSameLocalTarget(initialTarget, currentTarget, authenticatedUser, context, clientPlugin)) {
+            throw authenticationFailure(changeUserPacket);
+        }
+    }
+
+    private static boolean isSupportedChangeUserTarget(
+            ChangeUserTarget target, MysqlChangeUserPacket changeUserPacket) {
+        if (target == null || target.userIdentity().isEphemeral() || target.serverPlugin() == null) {
+            return false;
+        }
+        String serverPlugin = target.serverPlugin();
+        if (AuthPlugin.Server.AUTHENTICATION_OAUTH2.toString().equalsIgnoreCase(serverPlugin)) {
+            return false;
+        }
+        String clientPlugin = AuthPlugin.covertFromServerToClient(serverPlugin);
+        return clientPlugin != null && changeUserPacket.getAuthResponse() != null;
+    }
+
+    private static boolean isSameLocalTarget(
+            ChangeUserTarget initialTarget, ChangeUserTarget currentTarget,
+            UserIdentity authenticatedUser, ConnectContext context, String clientPlugin) {
+        UserIdentity contextUser = context.getCurrentUserIdentity();
+        return currentTarget != null
+                && !currentTarget.userIdentity().isEphemeral()
+                && currentTarget.userIdentity().equals(initialTarget.userIdentity())
+                && currentTarget.hasSameAuthentication(initialTarget)
+                && clientPlugin.equalsIgnoreCase(AuthPlugin.covertFromServerToClient(currentTarget.serverPlugin()))
+                && authenticatedUser != null
+                && !authenticatedUser.isEphemeral()
+                && authenticatedUser.equals(initialTarget.userIdentity())
+                && contextUser != null
+                && !contextUser.isEphemeral()
+                && contextUser.equals(initialTarget.userIdentity())
+                && initialTarget.userIdentity().getUser().equals(context.getQualifiedUser())
+                && ConfigBase.AUTHENTICATION_CHAIN_MECHANISM_NATIVE.equals(context.getSecurityIntegration())
+                && clientPlugin.equalsIgnoreCase(context.getAuthPlugin());
+    }
+
+    private record ChangeUserTarget(
+            UserIdentity userIdentity, String serverPlugin, byte[] password, String authString) {
+        private static ChangeUserTarget capture(Map.Entry<UserIdentity, UserAuthenticationInfo> target) {
+            if (target == null) {
+                return null;
+            }
+            UserAuthenticationInfo authenticationInfo = target.getValue();
+            byte[] password = authenticationInfo.getPassword();
+            return new ChangeUserTarget(
+                    target.getKey(), authenticationInfo.getAuthPlugin(),
+                    password == null ? null : Arrays.copyOf(password, password.length),
+                    authenticationInfo.getAuthString());
+        }
+
+        private boolean hasSameAuthentication(ChangeUserTarget other) {
+            return serverPlugin != null
+                    && other != null
+                    && other.serverPlugin != null
+                    && serverPlugin.equalsIgnoreCase(other.serverPlugin)
+                    && Arrays.equals(password, other.password)
+                    && Objects.equals(authString, other.authString);
+        }
+    }
+
+    private static void clearAuthenticationStateForChangeUser(ConnectContext context, String clientPlugin) {
+        context.setCurrentUserIdentity(null);
+        context.setQualifiedUser(null);
+        context.setCurrentRoleIds((Set<Long>) null);
+        context.setGroups(null);
+        context.setSecurityIntegration(null);
+        context.setDistinguishedName("");
+        context.setAuthToken(null);
+        context.setOAuth2Context(null);
+        context.setAuthPlugin(clientPlugin);
+    }
+
+    private static AuthenticationException authenticationFailure(MysqlChangeUserPacket changeUserPacket) {
+        byte[] authResponse = changeUserPacket.getAuthResponse();
+        String usePassword = authResponse == null || authResponse.length == 0 ? "NO" : "YES";
+        return new AuthenticationException(ErrorCode.ERR_AUTHENTICATION_FAIL,
+                changeUserPacket.getUser(), usePassword);
+    }
+
+    private static void setAuthenticationError(ConnectContext context, AuthenticationException exception) {
+        ErrorCode errorCode = exception.getErrorCode() == null
+                ? ErrorCode.ERR_AUTHENTICATION_FAIL : exception.getErrorCode();
+        context.getState().setErrorCode(errorCode);
+        context.getState().setError(exception.getMessage());
     }
 
     private static boolean rejectRangerManagedChangeUser(
@@ -323,24 +450,31 @@ public class MysqlProto {
             String previousUser, String targetUser, RuntimeException cause) throws IOException {
         LOG.warn("Command `Change user` denied at Ranger-managed identity boundary, from [{}] to [{}].",
                 previousUser, targetUser, cause);
+        restoreChangeUserState(context, previousAuthenticationState, previousSessionVariable,
+                previousCatalog, previousDb);
+        context.getState().setErrorCode(ErrorCode.ERR_ACCESS_DENIED_FOR_EXTERNAL_ACCESS_CONTROLLER);
+        context.getState().setError("COM_CHANGE_USER is not allowed for Ranger-managed users");
+        return false;
+    }
+
+    private static void restoreChangeUserState(
+            ConnectContext context, AuthenticationState previousAuthenticationState,
+            SessionVariable previousSessionVariable, String previousCatalog, String previousDb) {
         previousAuthenticationState.restore(context);
         context.setSessionVariable(previousSessionVariable);
         context.setCurrentCatalog(previousCatalog);
         context.setDatabase(previousDb);
-        context.getState().setErrorCode(ErrorCode.ERR_ACCESS_DENIED_FOR_EXTERNAL_ACCESS_CONTROLLER);
-        context.getState().setError("COM_CHANGE_USER is not allowed for Ranger-managed users");
-        sendResponsePacket(context);
-        context.getSerializer().setCapability(context.getCapability());
-        return false;
     }
 
     private record AuthenticationState(UserIdentity currentUserIdentity, String qualifiedUser, Set<Long> currentRoleIds,
-                                       Set<String> groups, String securityIntegration, String distinguishedName) {
+                                       Set<String> groups, String securityIntegration, String distinguishedName,
+                                       String authToken, OAuth2Context oAuth2Context, String authPlugin) {
         private static AuthenticationState capture(ConnectContext context) {
             return new AuthenticationState(
                     context.getCurrentUserIdentity(), context.getQualifiedUser(),
                     copySet(context.getCurrentRoleIds()), copySet(context.getGroups()),
-                    context.getSecurityIntegration(), context.getDistinguishedName());
+                    context.getSecurityIntegration(), context.getDistinguishedName(),
+                    context.getAuthToken(), context.getOAuth2Context(), context.getAuthPlugin());
         }
 
         private void restore(ConnectContext context) {
@@ -350,6 +484,9 @@ public class MysqlProto {
             context.setGroups(copySet(groups));
             context.setSecurityIntegration(securityIntegration);
             context.setDistinguishedName(distinguishedName);
+            context.setAuthToken(authToken);
+            context.setOAuth2Context(oAuth2Context);
+            context.setAuthPlugin(authPlugin);
         }
 
         private static <T> Set<T> copySet(Set<T> values) {

@@ -37,8 +37,11 @@ package com.starrocks.qe;
 import com.google.common.base.Strings;
 import com.google.common.collect.Sets;
 import com.starrocks.analysis.AccessTestUtil;
+import com.starrocks.analysis.IntLiteral;
 import com.starrocks.authentication.AuthenticationMgr;
+import com.starrocks.authentication.UserProperty;
 import com.starrocks.authorization.PrivilegeBuiltinConstants;
+import com.starrocks.catalog.Database;
 import com.starrocks.catalog.InternalCatalog;
 import com.starrocks.common.Config;
 import com.starrocks.common.FeConstants;
@@ -52,26 +55,40 @@ import com.starrocks.mysql.MysqlEofPacket;
 import com.starrocks.mysql.MysqlErrPacket;
 import com.starrocks.mysql.MysqlOkPacket;
 import com.starrocks.mysql.MysqlSerializer;
+import com.starrocks.mysql.RequestPackage;
 import com.starrocks.plugin.AuditEvent;
 import com.starrocks.plugin.AuditEvent.AuditEventBuilder;
 import com.starrocks.proto.PQueryStatistics;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.server.RunMode;
+import com.starrocks.service.ExecuteEnv;
 import com.starrocks.service.arrow.flight.sql.ArrowFlightSqlConnectProcessor;
 import com.starrocks.sql.analyzer.AnalyzerUtils;
 import com.starrocks.sql.analyzer.DDLTestBase;
 import com.starrocks.sql.ast.PrepareStmt;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.UserIdentity;
+import com.starrocks.sql.ast.UserVariable;
+import com.starrocks.sql.ast.txn.BeginStmt;
+import com.starrocks.sql.ast.txn.RollbackStmt;
+import com.starrocks.sql.parser.NodePosition;
+import com.starrocks.sql.spm.BaselinePlan;
+import com.starrocks.sql.spm.SQLPlanStorage;
 import com.starrocks.system.Frontend;
 import com.starrocks.thrift.TMasterOpRequest;
 import com.starrocks.thrift.TMasterOpResult;
 import com.starrocks.thrift.TUniqueId;
 import com.starrocks.thrift.TUserIdentity;
+import com.starrocks.transaction.ExplicitTxnState;
+import com.starrocks.transaction.GlobalTransactionMgr;
+import com.starrocks.transaction.TransactionState;
+import com.starrocks.transaction.TransactionStatus;
+import com.starrocks.transaction.TransactionStmtExecutor;
 import com.starrocks.utframe.UtFrameUtils;
 import com.starrocks.warehouse.DefaultWarehouse;
 import com.starrocks.warehouse.cngroup.ComputeResource;
 import com.starrocks.warehouse.cngroup.WarehouseComputeResourceProvider;
+import mockit.Delegate;
 import mockit.Expectations;
 import mockit.Mock;
 import mockit.MockUp;
@@ -90,8 +107,13 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 public class ConnectProcessorTest extends DDLTestBase {
@@ -133,9 +155,7 @@ public class ConnectProcessorTest extends DDLTestBase {
         // Change user packet
         {
             MysqlSerializer serializer = MysqlSerializer.newInstance();
-            serializer.writeInt1(17);
-            // code
-            serializer.writeInt1(17);
+            serializer.writeInt1(MysqlCommand.COM_CHANGE_USER.getCommandCode());
             // user name
             serializer.writeNulTerminateString("starrocks-user");
             // plugin data
@@ -149,6 +169,7 @@ public class ConnectProcessorTest extends DDLTestBase {
             serializer.writeNulTerminateString("testDb");
             // character set
             serializer.writeInt2(33);
+            serializer.writeNulTerminateString("mysql_native_password");
             changeUserPacket = serializer.toByteBuffer();
         }
 
@@ -220,14 +241,22 @@ public class ConnectProcessorTest extends DDLTestBase {
     }
 
     private static MysqlChannel mockChannel(ByteBuffer packet) {
+        return mockChannel(packet, null);
+    }
+
+    private static MysqlChannel mockChannel(ByteBuffer packet, AtomicInteger sendCount) {
         try {
             MysqlChannel channel = new MysqlChannel(connection);
+            ByteBuffer responsePacket = packet == null ? null : packet.duplicate();
+            if (responsePacket != null) {
+                responsePacket.position(0);
+            }
             new Expectations(channel) {
                 {
                     // Mock receive
                     channel.fetchOnePacket();
                     minTimes = 0;
-                    result = packet;
+                    result = responsePacket;
 
                     // Mock reset
                     channel.setSequenceId(0);
@@ -236,10 +265,21 @@ public class ConnectProcessorTest extends DDLTestBase {
                     // Mock send
                     channel.sendAndFlush((ByteBuffer) any);
                     minTimes = 0;
+                    if (sendCount != null) {
+                        result = new Delegate<Void>() {
+                            void sendAndFlush(ByteBuffer ignored) {
+                                sendCount.incrementAndGet();
+                            }
+                        };
+                    }
 
                     channel.getRemoteHostPortString();
                     minTimes = 0;
                     result = "127.0.0.1:12345";
+
+                    channel.getRemoteIp();
+                    minTimes = 0;
+                    result = "127.0.0.1";
                 }
             };
             return channel;
@@ -297,7 +337,7 @@ public class ConnectProcessorTest extends DDLTestBase {
                 context.isKilled();
                 minTimes = 0;
                 maxTimes = 3;
-                returns(false, true, false);
+                returns(false, false, true);
 
                 context.getGlobalStateMgr();
                 minTimes = 0;
@@ -340,6 +380,26 @@ public class ConnectProcessorTest extends DDLTestBase {
             }
         };
 
+        return context;
+    }
+
+    private static ConnectContext initProtocolContext(MysqlChannel channel) {
+        return initProtocolContext(new ConnectContext(connection), channel);
+    }
+
+    private static ConnectContext initProtocolContext(ConnectContext context, MysqlChannel channel) {
+        Deencapsulation.setField(context, "mysqlChannel", channel);
+        context.setGlobalStateMgr(GlobalStateMgr.getCurrentState());
+        context.setCapability(MysqlCapability.DEFAULT_CAPABILITY);
+        context.setQualifiedUser(UserIdentity.ROOT.getUser());
+        context.setCurrentUserIdentity(UserIdentity.ROOT);
+        context.setCurrentRoleIds(Sets.newHashSet(PrivilegeBuiltinConstants.ROOT_ROLE_ID));
+        context.setGroups(Sets.newHashSet("authenticated-group"));
+        context.setSecurityIntegration("native");
+        context.setAuthPlugin("mysql_native_password");
+        context.captureAuthenticatedIdentity();
+        context.setExecutionId(new TUniqueId(1L, 2L));
+        context.setThreadLocalInfo();
         return context;
     }
 
@@ -391,26 +451,441 @@ public class ConnectProcessorTest extends DDLTestBase {
 
     @Test
     public void testChangeUser() throws IOException {
-        ConnectContext ctx = initMockContext(mockChannel(changeUserPacket), GlobalStateMgr.getCurrentState());
+        AtomicInteger sendCount = new AtomicInteger();
+        ConnectContext ctx = initProtocolContext(mockChannel(changeUserPacket, sendCount));
 
         ConnectProcessor processor = new ConnectProcessor(ctx);
         processor.processOnce();
-        Assertions.assertEquals(MysqlCommand.COM_CHANGE_USER, myContext.getCommand());
-        Assertions.assertTrue(myContext.getState().toResponsePacket() instanceof MysqlOkPacket);
-        Assertions.assertFalse(myContext.isKilled());
+        Assertions.assertTrue(ctx.getState().toResponsePacket() instanceof MysqlErrPacket);
+        Assertions.assertEquals(1, sendCount.get());
+        Assertions.assertFalse(ctx.isKilled());
     }
 
     @Test
-    public void testResetConnection() throws IOException {
-        ConnectContext ctx = initMockContext(mockChannel(resetConnectionPacket), GlobalStateMgr.getCurrentState());
-        ctx.putPreparedStmt("stale", new PrepareStmtContext(createMockPrepareStmt("SELECT 1"), ctx, null));
+    public void testMalformedChangeUserSendsExactlyOneError() throws IOException {
+        ByteBuffer truncatedPacket = ByteBuffer.wrap(new byte[] {
+                (byte) MysqlCommand.COM_CHANGE_USER.getCommandCode(), 'u'
+        });
+        AtomicInteger sendCount = new AtomicInteger();
+        ConnectContext ctx = initProtocolContext(mockChannel(truncatedPacket, sendCount));
 
+        new ConnectProcessor(ctx).processOnce();
+
+        Assertions.assertTrue(ctx.getState().toResponsePacket() instanceof MysqlErrPacket);
+        Assertions.assertEquals(1, sendCount.get());
+        Assertions.assertFalse(ctx.isKilled());
+    }
+
+    @Test
+    public void testChangeUserWithActiveTransactionPreservesSourceSession() throws Exception {
+        AtomicInteger sendCount = new AtomicInteger();
+        ConnectContext ctx = initProtocolContext(mockChannel(changeUserPacket, sendCount));
+        TransactionStmtExecutor.beginStmt(
+                ctx, new BeginStmt(NodePosition.ZERO, "change-user-source-" + UUID.randomUUID()));
+        long transactionId = ctx.getTxnId();
+        GlobalTransactionMgr transactionMgr = GlobalStateMgr.getCurrentState().getGlobalTransactionMgr();
+        UUID previousSessionId = ctx.getSessionId();
+        SQLPlanStorage previousSqlPlanStorage = ctx.getSqlPlanStorage();
+        previousSqlPlanStorage.storeBaselinePlan(List.of(
+                new BaselinePlan("select source_secret", "select source_secret", 5L, "select source_secret", 1)));
+        long temporaryDatabaseId = Long.MAX_VALUE - 2;
+        GlobalStateMgr.getCurrentState().getTemporaryTableMgr()
+                .addTemporaryTable(previousSessionId, temporaryDatabaseId, "source_secret", 9003L);
+
+        try {
+            new ConnectProcessor(ctx).processOnce();
+
+            Assertions.assertTrue(ctx.getState().toResponsePacket() instanceof MysqlErrPacket);
+            Assertions.assertEquals(1, sendCount.get());
+            Assertions.assertFalse(ctx.isKilled());
+            Assertions.assertEquals(transactionId, ctx.getTxnId());
+            Assertions.assertNotNull(transactionMgr.getExplicitTxnState(transactionId));
+            Assertions.assertEquals(UserIdentity.ROOT.getUser(), ctx.getQualifiedUser());
+            Assertions.assertEquals(UserIdentity.ROOT, ctx.getCurrentUserIdentity());
+            Assertions.assertEquals(previousSessionId, ctx.getSessionId());
+            Assertions.assertSame(previousSqlPlanStorage, ctx.getSqlPlanStorage());
+            Assertions.assertEquals(9003L, GlobalStateMgr.getCurrentState().getTemporaryTableMgr()
+                    .getTable(previousSessionId, temporaryDatabaseId, "source_secret"));
+        } finally {
+            ctx.getState().reset();
+            ctx.setTxnId(transactionId);
+            TransactionStmtExecutor.rollbackStmt(ctx, new RollbackStmt(NodePosition.ZERO));
+            GlobalStateMgr.getCurrentState().getTemporaryTableMgr()
+                    .removeTemporaryTables(previousSessionId);
+        }
+    }
+
+    @Test
+    public void testChangeUserStartsIsolatedTargetSessionWithTargetProperties() throws Exception {
+        MysqlSerializer serializer = MysqlSerializer.newInstance();
+        serializer.writeInt1(MysqlCommand.COM_CHANGE_USER.getCommandCode());
+        serializer.writeNulTerminateString(UserIdentity.ROOT.getUser());
+        serializer.writeInt1(0);
+        serializer.writeNulTerminateString("");
+        serializer.writeInt2(33);
+        serializer.writeNulTerminateString("mysql_native_password");
+        ByteBuffer packet = serializer.toByteBuffer();
+
+        AtomicInteger sendCount = new AtomicInteger();
+        ConnectContext ctx = initProtocolContext(mockChannel(packet, sendCount));
+        ctx.getSessionVariable().setQueryTimeoutS(17);
+        ctx.getSessionVariable().setResourceGroup("source-resource-group");
+        UUID previousSessionId = ctx.getSessionId();
+        SQLPlanStorage previousSqlPlanStorage = ctx.getSqlPlanStorage();
+        previousSqlPlanStorage.storeBaselinePlan(List.of(
+                new BaselinePlan("select source_secret", "select source_secret", 7L, "select source_secret", 1)));
+        long temporaryDatabaseId = Long.MAX_VALUE - 1;
+        GlobalStateMgr.getCurrentState().getTemporaryTableMgr()
+                .addTemporaryTable(previousSessionId, temporaryDatabaseId, "source_secret", 9002L);
+
+        UserProperty rootProperty = GlobalStateMgr.getCurrentState().getAuthenticationMgr()
+                .getUserProperty(UserIdentity.ROOT.getUser());
+        Map<String, String> previousUserPropertyVariables =
+                new HashMap<>(rootProperty.getSessionVariables());
+        rootProperty.setSessionVariables(Map.of(
+                SessionVariable.QUERY_TIMEOUT, "654",
+                SessionVariable.RESOURCE_GROUP, "target-resource-group"));
+
+        new MockUp<ExecuteEnv>() {
+            @Mock
+            public ConnectScheduler getScheduler() {
+                return new ConnectScheduler(1000);
+            }
+        };
+
+        try {
+            new ConnectProcessor(ctx).processOnce();
+
+            Assertions.assertTrue(ctx.getState().toResponsePacket() instanceof MysqlOkPacket);
+            Assertions.assertEquals(1, sendCount.get());
+            Assertions.assertEquals(UserIdentity.ROOT.getUser(), ctx.getQualifiedUser());
+            Assertions.assertEquals(UserIdentity.ROOT, ctx.getCurrentUserIdentity());
+            Assertions.assertEquals(UserIdentity.ROOT, ctx.getAuthenticatedUserIdentity());
+            Assertions.assertEquals(654, ctx.getSessionVariable().getQueryTimeoutS());
+            Assertions.assertEquals("target-resource-group", ctx.getSessionVariable().getResourceGroup());
+            Assertions.assertNotEquals(previousSessionId, ctx.getSessionId());
+            Assertions.assertNull(GlobalStateMgr.getCurrentState().getTemporaryTableMgr()
+                    .getTable(ctx.getSessionId(), temporaryDatabaseId, "source_secret"));
+            Assertions.assertNotSame(previousSqlPlanStorage, ctx.getSqlPlanStorage());
+            Assertions.assertTrue(ctx.getSqlPlanStorage().getBaselines(null).isEmpty());
+        } finally {
+            rootProperty.setSessionVariables(previousUserPropertyVariables);
+            GlobalStateMgr.getCurrentState().getTemporaryTableMgr()
+                    .removeTemporaryTables(previousSessionId);
+        }
+    }
+
+    @Test
+    public void testResetConnection() throws Exception {
+        AtomicInteger sendCount = new AtomicInteger();
+        MysqlChannel channel = mockChannel(resetConnectionPacket, sendCount);
+        ConnectContext ctx = initProtocolContext(channel);
+        ctx.setConnectionId(77);
+        ctx.putPreparedStmt("stale", new PrepareStmtContext(createMockPrepareStmt("SELECT 1"), ctx, null));
+        ctx.modifyUserVariable(new UserVariable("committed", new IntLiteral(1), false, NodePosition.ZERO));
+        Map<String, UserVariable> committedVariables = ctx.getUserVariables();
+        Map<String, UserVariable> variablesCopyInWrite = new ConcurrentHashMap<>(committedVariables);
+        variablesCopyInWrite.put(
+                "pending", new UserVariable("pending", new IntLiteral(2), false, NodePosition.ZERO));
+        ctx.modifyUserVariablesCopyInWrite(variablesCopyInWrite);
+        SessionVariable previousSessionVariable = ctx.getSessionVariable();
+        int defaultQueryTimeout = GlobalStateMgr.getCurrentState().getVariableMgr()
+                .newSessionVariable().getQueryTimeoutS();
+        previousSessionVariable.setQueryTimeoutS(defaultQueryTimeout + 1);
+
+        SQLPlanStorage previousSqlPlanStorage = ctx.getSqlPlanStorage();
+        previousSqlPlanStorage.storeBaselinePlan(List.of(
+                new BaselinePlan(
+                        "select secret", "select secret", 1L,
+                        "select /*+ SET_VAR(query_timeout=1) */ secret", 1)));
+
+        UUID previousSessionId = ctx.getSessionId();
+        long temporaryDatabaseId = Long.MAX_VALUE;
+        GlobalStateMgr.getCurrentState().getTemporaryTableMgr()
+                .addTemporaryTable(previousSessionId, temporaryDatabaseId, "source_secret", 9001L);
+
+        GlobalTransactionMgr transactionMgr = GlobalStateMgr.getCurrentState().getGlobalTransactionMgr();
+        TransactionStmtExecutor.beginStmt(
+                ctx, new BeginStmt(NodePosition.ZERO, "reset-connection-" + UUID.randomUUID()));
+        long transactionId = ctx.getTxnId();
+        ExplicitTxnState explicitTxnState = transactionMgr.getExplicitTxnState(transactionId);
+        Database database = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("testDb1");
+        Assertions.assertNotNull(database);
+        TransactionState transactionState = explicitTxnState.getTransactionState();
+        transactionState.setDbId(database.getId());
+        transactionMgr.getDatabaseTransactionMgr(database.getId()).upsertTransactionState(transactionState);
+        ExplicitTxnState.ExplicitTxnStateItem transactionItem =
+                new ExplicitTxnState.ExplicitTxnStateItem();
+        transactionItem.setTabletCommitInfos(List.of());
+        transactionItem.setTabletFailInfos(List.of());
+        explicitTxnState.addTransactionItem(transactionItem);
+
+        ctx.setCurrentUserIdentity(new UserIdentity("impersonated", "%"));
+        ctx.setCurrentRoleIds(Sets.newHashSet(999L));
+        ctx.setGroups(Sets.newHashSet("impersonated-group"));
+
+        UserProperty rootProperty = GlobalStateMgr.getCurrentState().getAuthenticationMgr()
+                .getUserProperty(UserIdentity.ROOT.getUser());
+        Map<String, String> previousUserPropertyVariables =
+                new HashMap<>(rootProperty.getSessionVariables());
+        rootProperty.setSessionVariables(Map.of(
+                SessionVariable.QUERY_TIMEOUT, "321",
+                SessionVariable.RESOURCE_GROUP, "target-resource-group"));
+
+        try {
+            ConnectProcessor processor = new ConnectProcessor(ctx);
+            processor.processOnce();
+            Assertions.assertTrue(ctx.getState().toResponsePacket() instanceof MysqlOkPacket);
+            Assertions.assertEquals(1, sendCount.get());
+            Assertions.assertFalse(ctx.isKilled());
+            Assertions.assertEquals(0, ctx.getTxnId());
+            Assertions.assertNull(transactionMgr.getExplicitTxnState(transactionId));
+            Assertions.assertEquals(TransactionStatus.ABORTED,
+                    transactionMgr.getDatabaseTransactionMgr(database.getId())
+                            .getTransactionState(transactionId).getTransactionStatus());
+
+            Assertions.assertNotEquals(previousSessionId, ctx.getSessionId());
+            Assertions.assertNull(GlobalStateMgr.getCurrentState().getTemporaryTableMgr()
+                    .getTable(ctx.getSessionId(), temporaryDatabaseId, "source_secret"));
+            Assertions.assertNotSame(previousSqlPlanStorage, ctx.getSqlPlanStorage());
+            Assertions.assertTrue(ctx.getSqlPlanStorage().getBaselines(null).isEmpty());
+            previousSqlPlanStorage.storeBaselinePlan(List.of(
+                    new BaselinePlan("select later", "select later", 2L, "select later", 1)));
+            Assertions.assertTrue(ctx.getSqlPlanStorage().getBaselines(null).isEmpty());
+
+            Assertions.assertEquals(UserIdentity.ROOT, ctx.getCurrentUserIdentity());
+            Assertions.assertEquals(Sets.newHashSet(PrivilegeBuiltinConstants.ROOT_ROLE_ID),
+                    ctx.getCurrentRoleIds());
+            Assertions.assertEquals(Sets.newHashSet("authenticated-group"), ctx.getGroups());
+            Assertions.assertEquals(321, ctx.getSessionVariable().getQueryTimeoutS());
+            Assertions.assertEquals("target-resource-group", ctx.getSessionVariable().getResourceGroup());
+
+            Assertions.assertSame(channel, ctx.getMysqlChannel());
+            Assertions.assertEquals(77, ctx.getConnectionId());
+            Assertions.assertEquals(MysqlCapability.DEFAULT_CAPABILITY, ctx.getCapability());
+            Assertions.assertNull(ctx.getPreparedStmt("stale"));
+            Assertions.assertNotSame(previousSessionVariable, ctx.getSessionVariable());
+            Assertions.assertTrue(ctx.getUserVariables().isEmpty());
+            Assertions.assertNull(ctx.getUserVariablesCopyInWrite());
+            Assertions.assertNotSame(committedVariables, ctx.getUserVariables());
+
+            committedVariables.put("late-committed", new UserVariable(
+                    "late-committed", new IntLiteral(3), false, NodePosition.ZERO));
+            variablesCopyInWrite.put("late-pending", new UserVariable(
+                    "late-pending", new IntLiteral(4), false, NodePosition.ZERO));
+            Assertions.assertTrue(ctx.getUserVariables().isEmpty());
+            Assertions.assertNull(ctx.getUserVariablesCopyInWrite());
+        } finally {
+            rootProperty.setSessionVariables(previousUserPropertyVariables);
+            GlobalStateMgr.getCurrentState().getTemporaryTableMgr()
+                    .removeTemporaryTables(previousSessionId);
+            if (transactionMgr.getExplicitTxnState(transactionId) != null) {
+                ctx.setTxnId(transactionId);
+                TransactionStmtExecutor.rollbackStmt(ctx, new RollbackStmt(NodePosition.ZERO));
+            }
+        }
+    }
+
+    @Test
+    public void testResetConnectionFailsClosedWhenTransactionRollbackCannotBeVerified() throws Exception {
+        AtomicInteger sendCount = new AtomicInteger();
+        ConnectContext ctx = initProtocolContext(mockChannel(resetConnectionPacket, sendCount));
+        ctx.setTxnId(Long.MAX_VALUE);
+        ctx.putPreparedStmt("stale", new PrepareStmtContext(createMockPrepareStmt("SELECT 1"), ctx, null));
+        UUID previousSessionId = ctx.getSessionId();
+        SQLPlanStorage previousSqlPlanStorage = ctx.getSqlPlanStorage();
+        previousSqlPlanStorage.storeBaselinePlan(List.of(
+                new BaselinePlan("select secret", "select secret", 11L, "select secret", 1)));
+
+        new ConnectProcessor(ctx).processOnce();
+
+        Assertions.assertTrue(ctx.getState().toResponsePacket() instanceof MysqlErrPacket);
+        Assertions.assertEquals(1, sendCount.get());
+        Assertions.assertTrue(ctx.isKilled());
+        Assertions.assertEquals(Long.MAX_VALUE, ctx.getTxnId());
+        Assertions.assertEquals(previousSessionId, ctx.getSessionId());
+        Assertions.assertSame(previousSqlPlanStorage, ctx.getSqlPlanStorage());
+        Assertions.assertNotNull(ctx.getPreparedStmt("stale"));
+    }
+
+    @Test
+    public void testKilledResetConnectionDoesNotProcessQueuedPacket() throws Exception {
+        AtomicInteger sendCount = new AtomicInteger();
+        ConnectContext ctx = initProtocolContext(mockChannel(resetConnectionPacket, sendCount));
+        ctx.setTxnId(Long.MAX_VALUE);
         ConnectProcessor processor = new ConnectProcessor(ctx);
-        processor.processOnce();
-        Assertions.assertEquals(MysqlCommand.COM_RESET_CONNECTION, myContext.getCommand());
-        Assertions.assertTrue(myContext.getState().toResponsePacket() instanceof MysqlOkPacket);
-        Assertions.assertFalse(myContext.isKilled());
-        Assertions.assertNull(ctx.getPreparedStmt("stale"));
+        ByteBuffer resetPacket = resetConnectionPacket.duplicate();
+        resetPacket.position(0);
+
+        processor.processOnce(new RequestPackage(0, resetPacket));
+
+        Assertions.assertTrue(ctx.getState().toResponsePacket() instanceof MysqlErrPacket);
+        Assertions.assertTrue(ctx.isKilled());
+        Assertions.assertEquals(1, sendCount.get());
+        String resetError = ctx.getState().getErrorMessage();
+        ByteBuffer queuedPingPacket = pingPacket.duplicate();
+        queuedPingPacket.position(0);
+
+        processor.processOnce(new RequestPackage(1, queuedPingPacket));
+
+        Assertions.assertTrue(ctx.getState().toResponsePacket() instanceof MysqlErrPacket);
+        Assertions.assertEquals(resetError, ctx.getState().getErrorMessage());
+        Assertions.assertEquals(Long.MAX_VALUE, ctx.getTxnId());
+        Assertions.assertEquals(1, sendCount.get());
+    }
+
+    @Test
+    public void testResetConnectionAcceptsVerifiedFollowerRollbackResult() throws Exception {
+        AtomicInteger sendCount = new AtomicInteger();
+        ConnectContext ctx = initProtocolContext(mockChannel(resetConnectionPacket, sendCount));
+        ctx.setTxnId(1234L);
+        TMasterOpResult result = new TMasterOpResult();
+        result.setTxn_id(0);
+        LeaderOpExecutor leaderOpExecutor = Mockito.mock(LeaderOpExecutor.class);
+        Mockito.when(leaderOpExecutor.getResult()).thenReturn(result);
+
+        try (MockedConstruction<StmtExecutor> ignored = Mockito.mockConstruction(
+                StmtExecutor.class, (mock, constructionContext) -> {
+                    Mockito.doNothing().when(mock).execute();
+                    Mockito.when(mock.getIsForwardToLeaderOrInit(false)).thenReturn(true);
+                    Mockito.when(mock.getLeaderOpExecutor()).thenReturn(leaderOpExecutor);
+                })) {
+            new ConnectProcessor(ctx).processOnce();
+        }
+
+        Assertions.assertTrue(ctx.getState().toResponsePacket() instanceof MysqlOkPacket);
+        Assertions.assertEquals(1, sendCount.get());
+        Assertions.assertFalse(ctx.isKilled());
+        Assertions.assertEquals(0, ctx.getTxnId());
+    }
+
+    @Test
+    public void testResetConnectionRejectsNonzeroFollowerRollbackResult() throws Exception {
+        AtomicInteger sendCount = new AtomicInteger();
+        ConnectContext ctx = initProtocolContext(mockChannel(resetConnectionPacket, sendCount));
+        ctx.setTxnId(1234L);
+        UUID previousSessionId = ctx.getSessionId();
+        TMasterOpResult result = new TMasterOpResult();
+        result.setTxn_id(1234L);
+        LeaderOpExecutor leaderOpExecutor = Mockito.mock(LeaderOpExecutor.class);
+        Mockito.when(leaderOpExecutor.getResult()).thenReturn(result);
+
+        try (MockedConstruction<StmtExecutor> ignored = Mockito.mockConstruction(
+                StmtExecutor.class, (mock, constructionContext) -> {
+                    Mockito.doNothing().when(mock).execute();
+                    Mockito.when(mock.getIsForwardToLeaderOrInit(false)).thenReturn(true);
+                    Mockito.when(mock.getLeaderOpExecutor()).thenReturn(leaderOpExecutor);
+                })) {
+            new ConnectProcessor(ctx).processOnce();
+        }
+
+        Assertions.assertTrue(ctx.getState().toResponsePacket() instanceof MysqlErrPacket);
+        Assertions.assertEquals(1, sendCount.get());
+        Assertions.assertTrue(ctx.isKilled());
+        Assertions.assertEquals(1234L, ctx.getTxnId());
+        Assertions.assertEquals(previousSessionId, ctx.getSessionId());
+    }
+
+    @Test
+    public void testResetConnectionFailsClosedWithoutAuthenticatedIdentitySnapshot() throws Exception {
+        AtomicInteger sendCount = new AtomicInteger();
+        MysqlChannel channel = mockChannel(resetConnectionPacket, sendCount);
+        ConnectContext ctx = new ConnectContext(connection);
+        Deencapsulation.setField(ctx, "mysqlChannel", channel);
+        ctx.setGlobalStateMgr(GlobalStateMgr.getCurrentState());
+        ctx.setCapability(MysqlCapability.DEFAULT_CAPABILITY);
+        ctx.setQualifiedUser(UserIdentity.ROOT.getUser());
+        ctx.setCurrentUserIdentity(new UserIdentity("impersonated", "%"));
+        UUID previousSessionId = ctx.getSessionId();
+
+        new ConnectProcessor(ctx).processOnce();
+
+        Assertions.assertTrue(ctx.getState().toResponsePacket() instanceof MysqlErrPacket);
+        Assertions.assertEquals(1, sendCount.get());
+        Assertions.assertTrue(ctx.isKilled());
+        Assertions.assertEquals(previousSessionId, ctx.getSessionId());
+        Assertions.assertEquals(new UserIdentity("impersonated", "%"), ctx.getCurrentUserIdentity());
+    }
+
+    @Test
+    public void testResetConnectionNormalizesNullAuthenticatedMemberships() throws Exception {
+        AtomicInteger sendCount = new AtomicInteger();
+        ConnectContext ctx = initProtocolContext(mockChannel(resetConnectionPacket, sendCount));
+        ctx.setCurrentRoleIds((Set<Long>) null);
+        ctx.setGroups(null);
+        ctx.captureAuthenticatedIdentity();
+        ctx.setCurrentRoleIds(Sets.newHashSet(999L));
+        ctx.setGroups(Sets.newHashSet("impersonated-group"));
+
+        new ConnectProcessor(ctx).processOnce();
+
+        Assertions.assertTrue(ctx.getState().toResponsePacket() instanceof MysqlOkPacket);
+        Assertions.assertEquals(1, sendCount.get());
+        Assertions.assertFalse(ctx.isKilled());
+        Assertions.assertEquals(Set.of(), ctx.getCurrentRoleIds());
+        Assertions.assertEquals(Set.of(), ctx.getGroups());
+    }
+
+    @Test
+    public void testResetConnectionRotatesTempNamespaceWhenCleanupLeavesOrphan() throws Exception {
+        AtomicInteger cleanupCalls = new AtomicInteger();
+        ConnectContext contextWithFailedCleanup = new ConnectContext(connection) {
+            @Override
+            public void cleanTemporaryTable(UUID temporaryTableSessionId) {
+                cleanupCalls.incrementAndGet();
+            }
+        };
+        AtomicInteger sendCount = new AtomicInteger();
+        ConnectContext ctx = initProtocolContext(
+                contextWithFailedCleanup, mockChannel(resetConnectionPacket, sendCount));
+        UUID previousSessionId = ctx.getSessionId();
+        long temporaryDatabaseId = Long.MAX_VALUE - 3;
+        GlobalStateMgr.getCurrentState().getTemporaryTableMgr()
+                .addTemporaryTable(previousSessionId, temporaryDatabaseId, "source_secret", 9004L);
+
+        try {
+            new ConnectProcessor(ctx).processOnce();
+
+            Assertions.assertTrue(ctx.getState().toResponsePacket() instanceof MysqlOkPacket);
+            Assertions.assertEquals(1, sendCount.get());
+            Assertions.assertEquals(1, cleanupCalls.get());
+            Assertions.assertNotEquals(previousSessionId, ctx.getSessionId());
+            Assertions.assertEquals(9004L, GlobalStateMgr.getCurrentState().getTemporaryTableMgr()
+                    .getTable(previousSessionId, temporaryDatabaseId, "source_secret"));
+            Assertions.assertNull(GlobalStateMgr.getCurrentState().getTemporaryTableMgr()
+                    .getTable(ctx.getSessionId(), temporaryDatabaseId, "source_secret"));
+        } finally {
+            GlobalStateMgr.getCurrentState().getTemporaryTableMgr()
+                    .removeTemporaryTables(previousSessionId);
+        }
+    }
+
+    @Test
+    public void testResetConnectionFailsClosedWhenUserPropertiesCannotBeReapplied() throws Exception {
+        AtomicInteger sendCount = new AtomicInteger();
+        ConnectContext ctx = initProtocolContext(mockChannel(resetConnectionPacket, sendCount));
+        UserProperty rootProperty = GlobalStateMgr.getCurrentState().getAuthenticationMgr()
+                .getUserProperty(UserIdentity.ROOT.getUser());
+        Map<String, String> previousUserPropertyVariables =
+                new HashMap<>(rootProperty.getSessionVariables());
+        rootProperty.setSessionVariables(Map.of("unknown_reset_session_variable", "1"));
+
+        try {
+            ctx.getState().setError("preexisting error");
+            Assertions.assertFalse(ctx.updateSessionVariablesByUserProperty(rootProperty));
+            Assertions.assertEquals("preexisting error", ctx.getState().getErrorMessage());
+            ctx.getState().reset();
+
+            new ConnectProcessor(ctx).processOnce();
+
+            Assertions.assertTrue(ctx.getState().toResponsePacket() instanceof MysqlErrPacket);
+            Assertions.assertEquals(1, sendCount.get());
+            Assertions.assertTrue(ctx.isKilled());
+            Assertions.assertTrue(ctx.getState().getErrorMessage()
+                    .contains("unknown_reset_session_variable"));
+        } finally {
+            rootProperty.setSessionVariables(previousUserPropertyVariables);
+        }
     }
 
     @Test

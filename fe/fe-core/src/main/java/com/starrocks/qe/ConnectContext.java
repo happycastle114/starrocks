@@ -178,6 +178,12 @@ public class ConnectContext {
     // `currentUserIdentity` and `qualifiedUser` are the same user,
     // but currentUserIdentity may be modified by execute as statement.
     protected UserIdentity currentUserIdentity;
+    // The identity established by authentication. Unlike currentUserIdentity/currentRoleIds/groups,
+    // this snapshot is not changed by EXECUTE AS or SET ROLE and is used to restore a clean pooled
+    // session on COM_RESET_CONNECTION.
+    private UserIdentity authenticatedUserIdentity;
+    private Set<Long> authenticatedRoleIds;
+    private Set<String> authenticatedGroups;
     // currentRoleIds is the role that has taken effect in the current session.
     // Note that this set is not all roles belonging to the current user.
     // `execute as` will modify currentRoleIds and assign the active role of the impersonate user to currentRoleIds.
@@ -423,6 +429,10 @@ public class ConnectContext {
         return sqlPlanStorage;
     }
 
+    public void resetSqlPlanStorage() {
+        sqlPlanStorage = SQLPlanStorage.create(false);
+    }
+
     public void putPreparedStmt(String stmtName, PrepareStmtContext ctx) {
         this.preparedStmtCtxs.put(stmtName, ctx);
     }
@@ -520,6 +530,30 @@ public class ConnectContext {
 
     public void setCurrentUserIdentity(UserIdentity currentUserIdentity) {
         this.currentUserIdentity = currentUserIdentity;
+    }
+
+    public UserIdentity getAuthenticatedUserIdentity() {
+        return authenticatedUserIdentity;
+    }
+
+    public void captureAuthenticatedIdentity() {
+        authenticatedUserIdentity = currentUserIdentity;
+        authenticatedRoleIds = copySet(currentRoleIds);
+        authenticatedGroups = copySet(groups);
+    }
+
+    public boolean restoreAuthenticatedIdentity() {
+        if (authenticatedUserIdentity == null) {
+            return false;
+        }
+        currentUserIdentity = authenticatedUserIdentity;
+        currentRoleIds = copySet(authenticatedRoleIds);
+        groups = copySet(authenticatedGroups);
+        return true;
+    }
+
+    private static <T> Set<T> copySet(Set<T> values) {
+        return values == null ? new HashSet<>() : new HashSet<>(values);
     }
 
     public void setDistinguishedName(String distinguishedName) {
@@ -760,6 +794,8 @@ public class ConnectContext {
     public void resetSessionVariable() {
         this.sessionVariable = globalStateMgr.getVariableMgr().newSessionVariable();
         modifiedSessionVariables.clear();
+        userVariables = new ConcurrentHashMap<>();
+        userVariablesCopyInWrite = null;
     }
 
     public UserVariable getUserVariableCopyInWrite(String variable) {
@@ -953,6 +989,10 @@ public class ConnectContext {
         threadLocalInfo.remove();
         returnRows = 0;
         computeResource = null;
+    }
+
+    public boolean isClosed() {
+        return closed;
     }
 
     public boolean isKilled() {
@@ -1641,22 +1681,66 @@ public class ConnectContext {
     }
 
     public void cleanTemporaryTable() {
-        if (sessionId == null) {
+        cleanTemporaryTable(sessionId);
+    }
+
+    public void cleanTemporaryTable(UUID temporaryTableSessionId) {
+        if (temporaryTableSessionId == null) {
             return;
         }
-        if (!globalStateMgr.getTemporaryTableMgr().sessionExists(sessionId)) {
+        if (!globalStateMgr.getTemporaryTableMgr().sessionExists(temporaryTableSessionId)) {
             return;
         }
-        LOG.debug("clean temporary table on session {}", sessionId);
+        LOG.debug("clean temporary table on session {}", temporaryTableSessionId);
+        UUID previousQueryId = queryId;
+        TUniqueId previousExecutionId = executionId;
+        StmtExecutor previousExecutor = executor;
+        QueryState previousState = state;
+        QuerySource previousQuerySource = querySource;
+        boolean previousIsForward = isForward;
         try {
+            state = new QueryState();
             setQueryId(UUIDUtil.genUUID());
-            CleanTemporaryTableStmt cleanTemporaryTableStmt = new CleanTemporaryTableStmt(sessionId);
+            CleanTemporaryTableStmt cleanTemporaryTableStmt = new CleanTemporaryTableStmt(temporaryTableSessionId);
             cleanTemporaryTableStmt.setOrigStmt(
-                    new OriginStatement("clean temporary table on session '" + sessionId.toString() + "'"));
+                    new OriginStatement("clean temporary table on session '" + temporaryTableSessionId + "'"));
             executor = StmtExecutor.newInternalExecutor(this, cleanTemporaryTableStmt);
             executor.execute();
         } catch (Throwable e) {
-            LOG.warn("Failed to clean temporary table on session {}, {}", sessionId, e);
+            LOG.warn("Failed to clean temporary table on session {}", temporaryTableSessionId, e);
+        } finally {
+            queryId = previousQueryId;
+            executionId = previousExecutionId;
+            executor = previousExecutor;
+            state = previousState;
+            querySource = previousQuerySource;
+            isForward = previousIsForward;
+        }
+    }
+
+    public boolean updateSessionVariablesByUserProperty(UserProperty userProperty) {
+        if (getState().isError()) {
+            return false;
+        }
+        try {
+            applySessionVariablesByUserProperty(userProperty);
+            return true;
+        } catch (Exception e) {
+            LOG.warn("set session env failed: ", e);
+            if (!getState().isError()) {
+                getState().setErrorCode(ErrorCode.ERR_UNKNOWN_ERROR);
+                getState().setError(
+                        String.format("set session variables from user property failed: %s", e.getMessage()));
+            }
+            return false;
+        }
+    }
+
+    private void applySessionVariablesByUserProperty(UserProperty userProperty) throws Exception {
+        Map<String, String> sessionVariables = userProperty.getSessionVariables();
+        for (Map.Entry<String, String> entry : sessionVariables.entrySet()) {
+            SystemVariable variable = new SystemVariable(entry.getKey(), new StringLiteral(entry.getValue()));
+            globalStateMgr.getVariableMgr().setSystemVariable(sessionVariable, variable, true);
         }
     }
 
@@ -1665,11 +1749,7 @@ public class ConnectContext {
     public void updateByUserProperty(UserProperty userProperty) {
         try {
             // set session variables
-            Map<String, String> sessionVariables = userProperty.getSessionVariables();
-            for (Map.Entry<String, String> entry : sessionVariables.entrySet()) {
-                SystemVariable variable = new SystemVariable(entry.getKey(), new StringLiteral(entry.getValue()));
-                globalStateMgr.getVariableMgr().setSystemVariable(sessionVariable, variable, true);
-            }
+            applySessionVariablesByUserProperty(userProperty);
 
             // set catalog and database
             String catalog = userProperty.getCatalog();

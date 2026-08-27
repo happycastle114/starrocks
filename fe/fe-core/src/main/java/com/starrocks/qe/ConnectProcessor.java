@@ -87,10 +87,12 @@ import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.SetStmt;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.UserIdentity;
+import com.starrocks.sql.ast.txn.RollbackStmt;
 import com.starrocks.sql.common.AuditEncryptionChecker;
 import com.starrocks.sql.common.ErrorType;
 import com.starrocks.sql.common.LargeInPredicateException;
 import com.starrocks.sql.common.SqlDigestBuilder;
+import com.starrocks.sql.parser.NodePosition;
 import com.starrocks.sql.parser.ParsingException;
 import com.starrocks.sql.parser.SqlParser;
 import com.starrocks.staros.StarMgrServer;
@@ -98,6 +100,7 @@ import com.starrocks.system.Frontend;
 import com.starrocks.thrift.TMasterOpRequest;
 import com.starrocks.thrift.TMasterOpResult;
 import com.starrocks.thrift.TQueryOptions;
+import com.starrocks.thrift.TUniqueId;
 import com.starrocks.transaction.ExplicitTxnStatementValidator;
 import org.apache.commons.codec.binary.Hex;
 import org.apache.commons.lang3.StringUtils;
@@ -177,13 +180,16 @@ public class ConnectProcessor {
             LOG.warn("Failed to execute command `Change user`.");
             return;
         }
-        handleResetConnection();
+        if (resetConnectionSession()) {
+            ctx.getState().setOk();
+        }
     }
 
     // COM_RESET_CONNECTION: reset current connection session variables
     private void handleResetConnection() throws IOException {
-        resetConnectionSession();
-        ctx.getState().setOk();
+        if (resetConnectionSession()) {
+            ctx.getState().setOk();
+        }
     }
 
     // process COM_PING statement, do nothing, just return one OK packet.
@@ -191,7 +197,37 @@ public class ConnectProcessor {
         ctx.getState().setOk();
     }
 
-    private void resetConnectionSession() {
+    private boolean resetConnectionSession() {
+        if (!rollbackActiveTransaction()) {
+            ctx.setKilled();
+            return false;
+        }
+        if (!ctx.restoreAuthenticatedIdentity()) {
+            setResetConnectionError("Authenticated session identity is unavailable");
+            ctx.setKilled();
+            return false;
+        }
+
+        UserProperty userProperty = null;
+        UserIdentity authenticatedUser = ctx.getAuthenticatedUserIdentity();
+        if (!authenticatedUser.isEphemeral()) {
+            try {
+                userProperty = GlobalStateMgr.getCurrentState().getAuthenticationMgr()
+                        .getUserProperty(authenticatedUser.getUser());
+            } catch (RuntimeException e) {
+                LOG.warn("Failed to load authenticated user properties during session reset", e);
+                setResetConnectionError("Failed to restore authenticated user properties");
+                ctx.setKilled();
+                return false;
+            }
+        }
+
+        UUID oldSessionId = ctx.getSessionId();
+        // Rotate first: cleanup is best effort, but an orphaned old namespace must never be
+        // reachable from the new logical session.
+        ctx.setSessionId(UUIDUtil.genUUID());
+        ctx.cleanTemporaryTable(oldSessionId);
+
         // reconstruct serializer
         ctx.getSerializer().reset();
         ctx.getSerializer().setCapability(ctx.getCapability());
@@ -200,6 +236,62 @@ public class ConnectProcessor {
         ctx.clearPreparedStmts();
         // reset session variable
         ctx.resetSessionVariable();
+        ctx.resetSqlPlanStorage();
+        if (userProperty != null && !ctx.updateSessionVariablesByUserProperty(userProperty)) {
+            ctx.setKilled();
+            return false;
+        }
+        return true;
+    }
+
+    private boolean rollbackActiveTransaction() {
+        if (ctx.getTxnId() == 0) {
+            return true;
+        }
+
+        UUID previousQueryId = ctx.getQueryId();
+        TUniqueId previousExecutionId = ctx.getExecutionId();
+        boolean previousIsForward = ctx.isForward();
+        try {
+            RollbackStmt rollbackStmt = new RollbackStmt(NodePosition.ZERO);
+            rollbackStmt.setOrigStmt(new OriginStatement("ROLLBACK", 0));
+            ctx.setQueryId(UUIDUtil.genUUID());
+            StmtExecutor rollbackExecutor = new StmtExecutor(ctx, rollbackStmt);
+            rollbackExecutor.execute();
+            if (ctx.getState().isError()) {
+                if (ctx.getState().getErrorCode() == null) {
+                    ctx.getState().setErrorCode(ErrorCode.ERR_UNKNOWN_ERROR);
+                }
+                return false;
+            }
+            if (rollbackExecutor.getIsForwardToLeaderOrInit(false)) {
+                TMasterOpResult result = rollbackExecutor.getLeaderOpExecutor() == null
+                        ? null : rollbackExecutor.getLeaderOpExecutor().getResult();
+                if (result == null || !result.isSetTxn_id() || result.getTxn_id() != 0) {
+                    setResetConnectionError("Failed to verify explicit transaction rollback on leader");
+                    return false;
+                }
+                ctx.setTxnId(0);
+            }
+            if (ctx.getTxnId() != 0) {
+                setResetConnectionError("Failed to roll back explicit transaction");
+                return false;
+            }
+            return true;
+        } catch (Throwable e) {
+            LOG.warn("Failed to roll back explicit transaction during session reset", e);
+            setResetConnectionError("Failed to roll back explicit transaction");
+            return false;
+        } finally {
+            ctx.setQueryId(previousQueryId);
+            ctx.setExecutionId(previousExecutionId);
+            ctx.setIsForward(previousIsForward);
+        }
+    }
+
+    private void setResetConnectionError(String message) {
+        ctx.getState().setErrorCode(ErrorCode.ERR_UNKNOWN_ERROR);
+        ctx.getState().setError(message);
     }
 
     public static long getThreadAllocatedBytes(long threadId) {
@@ -1227,6 +1319,9 @@ public class ConnectProcessor {
     }
 
     public void processOnce(RequestPackage req) throws Exception {
+        if (ctx.isKilled() || ctx.isClosed()) {
+            return;
+        }
         // set status of query to OK.
         ctx.getState().reset();
         executor = null;
@@ -1247,6 +1342,9 @@ public class ConnectProcessor {
 
     // handle one process
     public void processOnce() throws IOException {
+        if (ctx.isKilled() || ctx.isClosed()) {
+            return;
+        }
         // set status of query to OK.
         ctx.getState().reset();
         executor = null;
