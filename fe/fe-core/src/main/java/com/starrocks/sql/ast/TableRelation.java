@@ -37,6 +37,7 @@ public class TableRelation extends Relation {
         _BINLOG_,
         _SYNC_MV_,
         _USE_PK_INDEX_,
+        _CACHE_STATS_,
     }
 
     private final TableName name;

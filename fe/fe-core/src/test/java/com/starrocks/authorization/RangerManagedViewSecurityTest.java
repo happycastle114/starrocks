@@ -121,7 +121,7 @@ public class RangerManagedViewSecurityTest {
         assertForbidden("SELECT value FROM db.tbl [_BINLOG_]", "_BINLOG_");
         assertForbidden("SELECT value FROM db.tbl [_SYNC_MV_]", "_SYNC_MV_");
         assertForbidden("SELECT value FROM db.tbl [_USE_PK_INDEX_]", "_USE_PK_INDEX_");
-        Assertions.assertTrue(RangerManagedViewSecurity.isForbiddenTableHint("_CACHE_STATS_"));
+        assertForbidden("SELECT value FROM db.tbl [_CACHE_STATS_]", "_CACHE_STATS_");
         assertForbidden("SELECT /*+ SET_VAR(query_timeout = 1) */ 1", "SET_VAR");
         assertForbidden("SELECT /*+ SET_USER_VARIABLE(@a = 1) */ @a", "SET_USER_VARIABLE");
     }
